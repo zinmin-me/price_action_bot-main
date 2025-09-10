@@ -328,16 +328,44 @@ class MT5Connector:
                     return None
                 price = current_price['ask'] if order_type == 'buy' else current_price['bid']
             
-            # Enforce stops level and freeze level
-            stops_level_points = getattr(self.symbol_info, 'trade_stops_level', 0)
-            freeze_level_points = getattr(self.symbol_info, 'trade_freeze_level', 0)
-            point = self.symbol_info.point if self.symbol_info else 0.0001
-            min_stop_dist = max(stops_level_points, freeze_level_points) * point
+            # Enforce stops level and freeze level using fresh symbol info for the current symbol
+            sym_info = mt5.symbol_info(self._symbol)
+            if sym_info is None:
+                logger.error(f"No symbol info for {self._symbol}")
+                return None
+            stops_level_points = getattr(sym_info, 'trade_stops_level', 0)
+            freeze_level_points = getattr(sym_info, 'trade_freeze_level', 0)
+            point = getattr(sym_info, 'point', 0.0001)
+            # Add small safety buffer of 2 points
+            min_stop_dist = (max(stops_level_points, freeze_level_points) + 2) * point
 
-            if sl is not None and abs(price - sl) < min_stop_dist:
-                sl = price - min_stop_dist if order_type.lower() == 'buy' else price + min_stop_dist
-            if tp is not None and abs(tp - price) < min_stop_dist:
-                tp = price + min_stop_dist if order_type.lower() == 'buy' else price - min_stop_dist
+            # Normalize SL/TP against direction and enforce minimum distances
+            if order_type.lower() == 'buy':
+                if sl is not None:
+                    # Ensure SL is below price by at least min_stop_dist
+                    if sl >= price - min_stop_dist:
+                        sl = price - (min_stop_dist * 1.2)
+                if tp is not None:
+                    # Ensure TP is above price by at least min_stop_dist
+                    if tp <= price + min_stop_dist:
+                        tp = price + (min_stop_dist * 1.2)
+            else:  # sell
+                if sl is not None:
+                    # Ensure SL is above price by at least min_stop_dist
+                    if sl <= price + min_stop_dist:
+                        sl = price + (min_stop_dist * 1.2)
+                if tp is not None:
+                    # Ensure TP is below price by at least min_stop_dist
+                    if tp >= price - min_stop_dist:
+                        tp = price - (min_stop_dist * 1.2)
+
+            # Round price and stops to symbol digits
+            digits = getattr(sym_info, 'digits', 5)
+            def _round(v):
+                return None if v is None else round(v, digits)
+            price = _round(price)
+            sl = _round(sl)
+            tp = _round(tp)
 
             # Prepare order request
             if order_type.lower() == 'buy':
@@ -357,7 +385,7 @@ class MT5Connector:
                 "sl": sl,
                 "tp": tp,
                 # Be a bit more permissive on slippage
-                "deviation": 50,
+                "deviation": 80,
                 "magic": magic,
                 "comment": self._sanitize_comment(comment),
                 "type_time": mt5.ORDER_TIME_GTC,
@@ -366,13 +394,20 @@ class MT5Connector:
             
             # Send order
             result = mt5.order_send(request)
-            if result is None:
-                logger.error(f"order_send returned None: {mt5.last_error()}")
-                return None
-            
-            if getattr(result, 'retcode', None) != mt5.TRADE_RETCODE_DONE:
-                logger.error(f"Order failed: {getattr(result, 'retcode', 'N/A')} - {getattr(result, 'comment', '')} last_error={mt5.last_error()}")
-                return None
+            if result is None or getattr(result, 'retcode', None) != mt5.TRADE_RETCODE_DONE:
+                # If invalid stops, retry once with SL/TP removed
+                ret = getattr(result, 'retcode', None) if result is not None else None
+                if ret == mt5.TRADE_RETCODE_INVALID_STOPS or ret == 10016:
+                    request['sl'] = None
+                    request['tp'] = None
+                    retry = mt5.order_send(request)
+                    if retry is None or getattr(retry, 'retcode', None) != mt5.TRADE_RETCODE_DONE:
+                        logger.error(f"Order failed: {getattr(retry, 'retcode', ret)} - {getattr(retry, 'comment', '')} last_error={mt5.last_error()}")
+                        return None
+                    result = retry
+                else:
+                    logger.error(f"Order failed: {ret} - {getattr(result, 'comment', '') if result else ''} last_error={mt5.last_error()}")
+                    return None
             
             logger.info(f"Market order placed: {order_type} {volume} {self._symbol} at {price}")
             return {
@@ -540,12 +575,13 @@ class MT5Connector:
             logger.error(f"Error getting orders: {e}")
             return []
     
-    def close_position(self, ticket: int) -> bool:
+    def close_position(self, ticket: int, reason: str = "Manual close") -> bool:
         """
         Close a position by ticket
         
         Args:
             ticket: Position ticket
+            reason: Reason for closing the position
             
         Returns:
             bool: True if successful, False otherwise
@@ -579,7 +615,7 @@ class MT5Connector:
                 "price": price,
                 "deviation": 20,
                 "magic": position.magic,
-                "comment": "Close position",
+                "comment": f"Close: {reason}",
                 "type_time": mt5.ORDER_TIME_GTC,
                 "type_filling": mt5.ORDER_FILLING_IOC,
             }
@@ -591,19 +627,20 @@ class MT5Connector:
                 logger.error(f"Failed to close position {ticket}: {result.retcode} - {result.comment}")
                 return False
             
-            logger.info(f"Position {ticket} closed successfully")
+            logger.info(f"Position {ticket} closed successfully - Reason: {reason}")
             return True
             
         except Exception as e:
             logger.error(f"Error closing position {ticket}: {e}")
             return False
     
-    def close_all_positions(self, symbol: str = None) -> Dict:
+    def close_all_positions(self, symbol: str = None, reason: str = "Close all positions") -> Dict:
         """
         Close all open positions
         
         Args:
             symbol: Trading symbol (None for all symbols)
+            reason: Reason for closing positions
             
         Returns:
             Dict: Summary of closed positions with success/failure counts
@@ -626,7 +663,7 @@ class MT5Connector:
                     symbol_name = pos['symbol']
                     pos_type = pos['type']
                     volume = pos['volume']
-                    success = self.close_position(ticket)
+                    success = self.close_position(ticket, reason)
                     detail = {
                         'ticket': ticket,
                         'symbol': symbol_name,

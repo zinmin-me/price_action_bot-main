@@ -13,6 +13,7 @@ from config import (
     TELEGRAM_BOT_TOKEN,
     SYMBOL,
     SYMBOLS,
+    TIMEFRAME,
     RISK_PERCENTAGE,
     DEFAULT_SL_POINTS,
     DEFAULT_TP_POINTS,
@@ -24,6 +25,10 @@ from config import (
     NEWS_CATEGORY,
 )
 from mt5_connector import MT5Connector
+try:
+    from ai.auto_trainer import AutoTrainer
+except Exception:
+    AutoTrainer = None
 
 # python-telegram-bot v20
 from telegram import (
@@ -51,11 +56,12 @@ def _build_main_reply_keyboard(news_count: int = 0) -> ReplyKeyboardMarkup:
     keyboard_layout = [
         ["ℹ️ Info", "👤 Account"],
         ["📊 Positions", "📋 Orders"],
-        ["🟢 Buy", "🔴 Sell"],
-        ["▶️ Start Trade", "⏹️ End Trade"],
+        ["🟢 Start Trade", "🔴 End Trade"],
         ["📈 Performance", "🧾 History"],
-        ["🔔 Alerts On/Off", news_label],
-        ["🧠 Analyze Now"],
+        ["⚠️ Close Reasons","🧠 Analyze Now"],
+        ["🤖 AI Status"],
+        ["🚀 AI Train", "📈 AI Performance"],
+        [news_label],
     ]
     return ReplyKeyboardMarkup(
         keyboard_layout,
@@ -105,6 +111,8 @@ class TelegramBot:
         self._sessions: Dict[int, MT5Connector] = {}
         # Per-chat login state machine: chat_id -> {stage, login, password, server}
         self._login_states: Dict[int, Dict[str, str]] = {}
+        # Auto-trainer instance
+        self.auto_trainer: Optional[AutoTrainer] = None
 
     def _get_session(self, chat_id: int) -> Optional[MT5Connector]:
         """Return per-chat MT5Connector if exists, else None (force login)."""
@@ -232,6 +240,13 @@ class TelegramBot:
                 self.controller.unsubscribe_telemetry(chat_id)
             except Exception:
                 pass
+
+            # Stop AutoTrainer if running
+            try:
+                if self.auto_trainer:
+                    self.auto_trainer.stop_auto_training()
+            except Exception:
+                pass
             
         except Exception as e:
             logger.exception("Error during stop trade")
@@ -290,6 +305,27 @@ class TelegramBot:
     async def _cmd_analyze_now(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Force an immediate analysis pass and send snapshot to Telegram."""
         try:
+            # Ensure we use this chat's MT5 session for data access
+            chat_id = update.effective_chat.id
+            session = self._get_session(chat_id)
+            if not session:
+                await update.message.reply_text("Please /login first.")
+                return
+            # Reconnect if the session is not currently connected
+            try:
+                if not getattr(session, 'connected', False):
+                    ok = session.connect()
+                    if not ok:
+                        await update.message.reply_text("❌ Could not connect to MT5. Please /login again.")
+                        return
+            except Exception:
+                await update.message.reply_text("❌ MT5 connection error. Please /login again.")
+                return
+            # Attach the session to the controller temporarily
+            try:
+                self.controller.set_mt5_connector(session)
+            except Exception:
+                pass
             snap = self.controller.generate_analysis_snapshot()
             if snap:
                 await update.message.reply_text(snap)
@@ -319,6 +355,15 @@ class TelegramBot:
                 "✅ Auto trading enabled. Use 🧠 Analyze Now anytime to see the latest analysis.",
                 reply_markup=_build_main_reply_keyboard(),
             )
+
+            # Start AutoTrainer for continuous retraining if available
+            try:
+                if AutoTrainer and hasattr(self.controller, 'ai_strategy') and self.controller.ai_strategy:
+                    if self.auto_trainer is None:
+                        self.auto_trainer = AutoTrainer(self.controller.ai_strategy, session)
+                    self.auto_trainer.start_auto_training()
+            except Exception:
+                logger.exception("Failed to start AutoTrainer after enabling trading")
         except Exception as e:
             logger.exception("Error enabling trading")
             await update.message.reply_text(f"❌ Failed to enable trading: {e}")
@@ -526,10 +571,10 @@ class TelegramBot:
         await update.message.reply_text(f"Closed {closed} positions.")
 
     async def _cmd_buy(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await self._place_market(update, order_type="buy")
+        await update.message.reply_text("Trading buttons are temporarily disabled.")
 
     async def _cmd_sell(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await self._place_market(update, order_type="sell")
+        await update.message.reply_text("Trading buttons are temporarily disabled.")
 
     async def _place_market(self, update: Update, order_type: str):
         # Best-effort TP/SL using defaults and account-based lot sizing via controller logic
@@ -884,6 +929,367 @@ class TelegramBot:
             logger.exception("Error fetching news/calendar")
             await update.message.reply_text("Error fetching news/calendar.")
 
+    async def _cmd_ai_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show AI strategy status"""
+        try:
+            # Check if AI is available
+            if not hasattr(self.controller, 'ai_strategy') or self.controller.ai_strategy is None:
+                await update.message.reply_text("❌ AI Strategy not available. Please ensure AI components are properly installed.")
+                return
+            
+            ai_strategy = self.controller.ai_strategy
+            
+            # Get strategy info with error handling
+            try:
+                status = ai_strategy.get_strategy_info()
+            except Exception as e:
+                logger.error(f"Error getting strategy info: {e}")
+                status = {
+                    'is_trained': False,
+                    'enabled': False,
+                    'prediction_horizon': 5,
+                    'min_confidence_threshold': 0.6,
+                    'risk_reward_ratio': 2.0,
+                    'available_models': []
+                }
+            
+            # Get performance info with error handling
+            try:
+                performance = ai_strategy.get_model_performance()
+            except Exception as e:
+                logger.error(f"Error getting performance info: {e}")
+                performance = {
+                    'prediction_accuracy': {
+                        'total_predictions': 0,
+                        'accuracy': 0.0
+                    },
+                    'last_prediction': None
+                }
+            
+            # Build status message
+            message_lines = [
+                "🤖 <b>AI Strategy Status</b>",
+                "",
+                f"<b>Training Status:</b> {'✅ Trained' if status.get('is_trained', False) else '❌ Not Trained'}",
+                f"<b>Enabled:</b> {'✅ Yes' if status.get('enabled', False) else '❌ No'}",
+                f"<b>Prediction Horizon:</b> {status.get('prediction_horizon', 5)} periods",
+                f"<b>Confidence Threshold:</b> {status.get('min_confidence_threshold', 0.6):.2f}",
+                f"<b>Risk/Reward Ratio:</b> {status.get('risk_reward_ratio', 2.0):.1f}",
+                "",
+                "<b>Performance Metrics:</b>",
+                f"• Total Predictions: {performance.get('prediction_accuracy', {}).get('total_predictions', 0)}",
+                f"• Accuracy: {performance.get('prediction_accuracy', {}).get('accuracy', 0.0):.3f}",
+            ]
+            
+            # Add last confidence if available
+            last_prediction = performance.get('last_prediction')
+            if last_prediction and isinstance(last_prediction, dict):
+                confidence = last_prediction.get('confidence', 0)
+                message_lines.append(f"• Last Confidence: {confidence:.3f}")
+            else:
+                message_lines.append("• Last Confidence: N/A")
+            
+            message_lines.extend([
+                "",
+                "<b>Available Models:</b>",
+            ])
+            
+            available_models = status.get('available_models', [])
+            if available_models:
+                for model in available_models:
+                    message_lines.append(f"• {model}")
+            else:
+                message_lines.append("• No models available")
+            
+            message = "\n".join(message_lines)
+            await update.message.reply_text(message, parse_mode='HTML')
+            
+        except Exception as e:
+            logger.error(f"Error in AI status command: {e}")
+            await update.message.reply_text(f"❌ Error getting AI status: {e}")
+
+    async def _cmd_ai_train(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Train AI models"""
+        try:
+            # Check if AI is available
+            if not hasattr(self.controller, 'ai_strategy') or self.controller.ai_strategy is None:
+                await update.message.reply_text("❌ AI Strategy not available. Please ensure AI components are properly installed.")
+                return
+            
+            # Get data periods parameter
+            data_periods = 2000
+            if context.args and len(context.args) > 0:
+                try:
+                    data_periods = int(context.args[0])
+                    data_periods = max(500, min(data_periods, 10000))  # Limit between 500-10000
+                except ValueError:
+                    await update.message.reply_text("❌ Invalid data periods. Using default 2000.")
+            
+            await update.message.reply_text(f"🤖 Starting AI training with {data_periods} data points...")
+            
+            # Get historical data and train
+            session = self._get_session(update.effective_chat.id)
+            if not session:
+                await update.message.reply_text("Please /login first.")
+                return
+            
+            # Send progress update
+            progress_msg = await update.message.reply_text("📊 Fetching historical data...")
+            
+            # Get historical data for training
+            historical_data = []
+            for symbol in SYMBOLS:
+                try:
+                    session.change_symbol(symbol)
+                    df = session.get_rates(symbol, TIMEFRAME, data_periods)
+                    if df is not None and not df.empty:
+                        df['symbol'] = symbol
+                        historical_data.append(df)
+                except Exception as e:
+                    logger.warning(f"Failed to get data for {symbol}: {e}")
+                    continue
+            
+            if not historical_data:
+                await update.message.reply_text("❌ Failed to get historical data for training")
+                return
+            
+            # Combine data
+            import pandas as pd
+            if historical_data:
+                combined_data = pd.concat(historical_data, ignore_index=True)
+                
+                # Handle time column properly
+                if 'time' in combined_data.columns:
+                    combined_data = combined_data.sort_values('time')
+                else:
+                    # If no time column, use index
+                    combined_data = combined_data.sort_index()
+                
+                combined_data = combined_data.drop_duplicates()
+                
+                # Reset index to avoid RangeIndex issues
+                combined_data = combined_data.reset_index(drop=True)
+                
+                # Ensure we have the required OHLC columns
+                required_columns = ['open', 'high', 'low', 'close']
+                if not all(col in combined_data.columns for col in required_columns):
+                    await update.message.reply_text("❌ Historical data missing required OHLC columns")
+                    return
+            else:
+                await update.message.reply_text("❌ No historical data available for training")
+                return
+            
+            # Update progress
+            await progress_msg.edit_text("🧠 Training AI models... (This may take a few minutes)")
+            
+            # Train models
+            result = self.controller.ai_strategy.train_models(combined_data)
+            
+            if 'error' in result:
+                await update.message.reply_text(f"❌ Training failed: {result['error']}")
+            else:
+                # Compute per-symbol accuracy using the trained ensemble
+                try:
+                    ai_strategy = self.controller.ai_strategy
+                    per_symbol = {}
+                    symbols_in_data = sorted(set(combined_data.get('symbol', []))) if 'symbol' in combined_data.columns else []
+                    for sym in symbols_in_data:
+                        df_sym = combined_data[combined_data['symbol'] == sym]
+                        # Build features and targets for this symbol
+                        feat_df = ai_strategy.data_processor.create_features(df_sym)
+                        features, targets = ai_strategy.data_processor.prepare_training_data(
+                            feat_df, df_sym, prediction_horizon=ai_strategy.prediction_horizon
+                        )
+                        if features.empty or targets is None or len(targets) == 0:
+                            continue
+                        X_sym = ai_strategy.data_processor.transform_features(features)
+                        if X_sym.size == 0:
+                            continue
+                        preds, _ = ai_strategy.model_manager.predict(X_sym, 'ensemble')
+                        if preds.size == 0:
+                            continue
+                        import numpy as np
+                        acc = float((preds == targets.values[:len(preds)]).mean())
+                        per_symbol[sym] = acc
+                    # Persist into model metadata and save
+                    if per_symbol:
+                        ai_strategy.model_manager.model_metadata['per_symbol_accuracy'] = per_symbol
+                        ai_strategy.model_manager.save_models()
+                except Exception as ex:
+                    logger.warning(f"Failed to compute per-symbol accuracy: {ex}")
+
+                # Export combined dataset to ai/data
+                try:
+                    import os
+                    from datetime import datetime
+                    os.makedirs('ai/data', exist_ok=True)
+                    # Build a short symbols tag (first 5 symbols if long)
+                    sym_list = SYMBOLS if isinstance(SYMBOLS, list) else [SYMBOLS]
+                    sym_tag = ",".join(sym_list[:5])
+                    if len(sym_list) > 5:
+                        sym_tag += ",…"
+                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    safe_tag = sym_tag.replace('/', '').replace(' ', '')
+                    csv_path = os.path.join('ai/data', f'train_{safe_tag}_{timestamp}.csv')
+                    combined_data.to_csv(csv_path, index=False)
+                    await update.message.reply_text(f"💾 Training dataset saved: {csv_path}")
+                except Exception as ex:
+                    logger.warning(f"Failed to export training dataset: {ex}")
+
+                message_lines = [
+                    "✅ <b>AI Training Completed</b>",
+                    "",
+                    f"<b>Status:</b> {result.get('status', 'Unknown')}",
+                    f"<b>Samples:</b> {result.get('n_samples', 0)}",
+                    f"<b>Features:</b> {result.get('n_features', 0)}",
+                    f"<b>Models Trained:</b> {result.get('models_trained', 0)}",
+                ]
+                
+                # Add training results
+                training_results = result.get('training_results', {})
+                if training_results:
+                    message_lines.extend(["", "<b>Model Performance:</b>"])
+                    for model_name, model_result in training_results.items():
+                        if 'error' not in model_result:
+                            val_score = model_result.get('val_score', 0)
+                            cv_mean = model_result.get('cv_mean', 0)
+                            message_lines.append(f"• {model_name}: {val_score:.3f} (CV: {cv_mean:.3f})")
+                # Append per-symbol accuracy if available
+                try:
+                    per_symbol = self.controller.ai_strategy.model_manager.model_metadata.get('per_symbol_accuracy', {})
+                    if per_symbol:
+                        message_lines.extend(["", "<b>Per-Symbol Accuracy:</b>"])
+                        for sym, acc in per_symbol.items():
+                            message_lines.append(f"• {sym}: {acc:.3f}")
+                except Exception:
+                    pass
+                
+                message = "\n".join(message_lines)
+                await update.message.reply_text(message, parse_mode='HTML')
+            
+        except Exception as e:
+            logger.error(f"Error in AI train command: {e}")
+            await update.message.reply_text(f"❌ Training error: {e}")
+
+    async def _cmd_ai_performance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show AI performance report"""
+        try:
+            # Check if AI is available
+            if not hasattr(self.controller, 'ai_strategy') or self.controller.ai_strategy is None:
+                await update.message.reply_text("❌ AI Strategy not available. Please ensure AI components are properly installed.")
+                return
+            
+            ai_strategy = self.controller.ai_strategy
+            
+            # Get performance info with error handling
+            try:
+                performance = ai_strategy.get_model_performance()
+            except Exception as e:
+                logger.error(f"Error getting performance info: {e}")
+                performance = {
+                    'prediction_accuracy': {
+                        'total_predictions': 0,
+                        'correct_predictions': 0,
+                        'accuracy': 0.0
+                    },
+                    'is_trained': False,
+                    'total_predictions': 0,
+                    'last_prediction': None
+                }
+            
+            message_lines = [
+                "📊 **AI Performance Report**",
+                "",
+                "**Prediction Accuracy:**",
+                f"• Total Predictions: {performance.get('prediction_accuracy', {}).get('total_predictions', 0)}",
+                f"• Correct Predictions: {performance.get('prediction_accuracy', {}).get('correct_predictions', 0)}",
+                f"• Accuracy: {performance.get('prediction_accuracy', {}).get('accuracy', 0.0):.3f}",
+                "",
+                "**Model Information:**",
+                f"• Is Trained: {'✅ Yes' if performance.get('is_trained', False) else '❌ No'}",
+                f"• Total Predictions Made: {performance.get('total_predictions', 0)}",
+            ]
+            
+            # Add last prediction info
+            last_prediction = performance.get('last_prediction')
+            if last_prediction and isinstance(last_prediction, dict):
+                message_lines.extend([
+                    "",
+                    "**Last Prediction:**",
+                    f"• Time: {last_prediction.get('timestamp', 'N/A')}",
+                    f"• Prediction: {last_prediction.get('prediction', 'N/A')}",
+                    f"• Confidence: {last_prediction.get('confidence', 0.0):.3f}",
+                ])
+            else:
+                message_lines.extend([
+                    "",
+                    "**Last Prediction:**",
+                    "• No predictions made yet",
+                ])
+            
+            message = "\n".join(message_lines)
+            await update.message.reply_text(message, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"Error in AI performance command: {e}")
+            await update.message.reply_text(f"❌ Error getting performance: {e}")
+    
+    async def _cmd_close_reasons(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show close reasons statistics"""
+        try:
+            if not self.controller or not hasattr(self.controller, 'get_close_reasons_stats'):
+                await update.message.reply_text("❌ Close reasons tracking not available")
+                return
+            
+            stats = self.controller.get_close_reasons_stats()
+            
+            if stats['total_closes'] == 0:
+                await update.message.reply_text("📊 **Close Reasons Report**\n\nNo positions closed yet.")
+                return
+            
+            message_parts = [
+                "📊 <b>Close Reasons Report</b>",
+                f"Total Closes: {stats['total_closes']}",
+                "",
+                "<b>Close Reasons:</b>"
+            ]
+            
+            # Show reason counts
+            for reason, count in stats['reasons'].items():
+                avg_profit = stats['avg_profit_by_reason'].get(reason, 0)
+                profit_emoji = "💰" if avg_profit > 0 else "📉" if avg_profit < 0 else "➖"
+                message_parts.append(f"{profit_emoji} {reason}: {count} times (Avg P/L: {avg_profit:.2f})")
+            
+            message_parts.extend([
+                "",
+                "<b>By Strategy:</b>"
+            ])
+            
+            # Show strategy counts
+            for strategy, count in stats['strategies'].items():
+                message_parts.append(f"• {strategy}: {count} closes")
+            
+            # Show recent closes
+            if stats['recent_closes']:
+                message_parts.extend([
+                    "",
+                    "<b>Recent Closes:</b>"
+                ])
+                for close in stats['recent_closes'][-3:]:  # Show last 3
+                    profit_emoji = "💰" if close['profit'] > 0 else "📉"
+                    timestamp = close['timestamp'].strftime("%H:%M")
+                    message_parts.append(
+                        f"{profit_emoji} #{close['ticket']} {close['symbol']} "
+                        f"({close['type']}) - {close['reason']} - P/L: {close['profit']:.2f} [{timestamp}]"
+                    )
+            
+            message = "\n".join(message_parts)
+            await update.message.reply_text(message, parse_mode='HTML')
+            
+        except Exception as e:
+            logger.error(f"Error in close reasons command: {e}")
+            await update.message.reply_text("❌ Error retrieving close reasons data")
+
     async def _on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.message or not update.message.text:
             return
@@ -938,28 +1344,28 @@ class TelegramBot:
             await self._cmd_positions(update, context)
         elif text in ("orders", "📋 orders"):
             await self._cmd_orders(update, context)
-        elif text in ("buy", "🟢 buy"):
-            await self._cmd_buy(update, context)
-        elif text in ("sell", "🔴 sell"):
-            await self._cmd_sell(update, context)
-        elif text in ("start trade", "▶️ start trade"):
+        # Buy/Sell commands removed
+        elif text in ("start trade", "▶️ start trade", "🟢 start trade"):
             await self._cmd_start_trade(update, context)
-        elif text in ("end trade", "⏹️ end trade"):
+        elif text in ("end trade", "⏹️ end trade", "🔴 end trade"):
             await self._cmd_stop(update, context)
         elif text in ("performance", "📈 performance"):
             await self._cmd_performance(update, context)
         elif text in ("history", "🧾 history"):
             await self._cmd_history(update, context)
-        elif text in ("alerts on", "🔔 alerts on"):
-            await self._cmd_alerts_on(update, context)
-        elif text in ("alerts off", "🔔 alerts off"):
-            await self._cmd_alerts_off(update, context)
-        elif text in ("alerts on/off", "🔔 alerts on/off"):
-            await self._cmd_alerts_toggle(update, context)
+        # Alerts button removed
         elif text in ("news", "📰 news"):
             await self._cmd_news(update, context)
         elif text in ("analyze now", "🔎 analyze now", "🧠 analyze now"):
             await self._cmd_analyze_now(update, context)
+        elif text in ("ai status", "🤖 ai status"):
+            await self._cmd_ai_status(update, context)
+        elif text in ("ai train", "🤖 ai train"):
+            await self._cmd_ai_train(update, context)
+        elif text in ("ai performance", "🤖 ai performance", "📈 ai performance"):
+            await self._cmd_ai_performance(update, context)
+        elif text in ("close reasons", "📊 close reasons", "⚠️ close reasons"):
+            await self._cmd_close_reasons(update, context)
         elif text in ("debug", "🐛 debug"):
             await self._cmd_debug(update, context)
         elif text in ("login", "🔑 login"):
@@ -993,14 +1399,12 @@ class TelegramBot:
         application.add_handler(CommandHandler("positions", self._cmd_positions))
         application.add_handler(CommandHandler("orders", self._cmd_orders))
         application.add_handler(CommandHandler("close_all", self._cmd_close_all))
-        application.add_handler(CommandHandler("buy", self._cmd_buy))
-        application.add_handler(CommandHandler("sell", self._cmd_sell))
+        # Buy/Sell handlers removed per request
         application.add_handler(CommandHandler("set_risk", self._cmd_set_risk))
         application.add_handler(CommandHandler("set_tp_sl", self._cmd_set_tp_sl))
         application.add_handler(CommandHandler("performance", self._cmd_performance))
         application.add_handler(CommandHandler("history", self._cmd_history))
-        application.add_handler(CommandHandler("alerts_on", self._cmd_alerts_on))
-        application.add_handler(CommandHandler("alerts_off", self._cmd_alerts_off))
+        # Alerts handlers removed per request
         application.add_handler(CommandHandler("news", self._cmd_news))
 
         # Inline callbacks for show/hide keyboard
@@ -1047,14 +1451,12 @@ class TelegramBot:
             application.add_handler(CommandHandler("close_all", self._cmd_close_all))
             application.add_handler(CommandHandler("menu", self._cmd_menu))
             application.add_handler(CommandHandler("close", self._cmd_close))
-            application.add_handler(CommandHandler("buy", self._cmd_buy))
-            application.add_handler(CommandHandler("sell", self._cmd_sell))
+            # Buy/Sell handlers removed per request
             application.add_handler(CommandHandler("set_risk", self._cmd_set_risk))
             application.add_handler(CommandHandler("set_tp_sl", self._cmd_set_tp_sl))
             application.add_handler(CommandHandler("performance", self._cmd_performance))
             application.add_handler(CommandHandler("history", self._cmd_history))
-            application.add_handler(CommandHandler("alerts_on", self._cmd_alerts_on))
-            application.add_handler(CommandHandler("alerts_off", self._cmd_alerts_off))
+            # Alerts handlers removed per request
             application.add_handler(CommandHandler("news", self._cmd_news))
             application.add_handler(CallbackQueryHandler(self._on_inline_toggle))
             # Text handler for reply keyboard buttons
@@ -1074,8 +1476,16 @@ class TelegramBot:
     def stop(self):
         try:
             if self.application:
-                # Graceful stop; run_polling will exit
-                self.application.stop()
+                # Graceful stop; run_polling will exit. Ensure coroutine is awaited from thread loop.
+                if self._loop and self._loop.is_running():
+                    fut = asyncio.run_coroutine_threadsafe(self.application.stop(), self._loop)
+                    fut.result(timeout=5)
+                else:
+                    # Fallback: call stop synchronously if loop not available
+                    try:
+                        self.application.stop_running()
+                    except Exception:
+                        pass
         except Exception:
             logger.exception("Error stopping Telegram application")
 
@@ -1085,10 +1495,20 @@ class TelegramBot:
             if not self.application or not self._loop:
                 return
             fut = asyncio.run_coroutine_threadsafe(
-                self.application.bot.send_message(chat_id=chat_id, text=text),
+                self.application.bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=True),
                 self._loop,
             )
-            fut.result(timeout=5)
+            try:
+                # Allow more time for Telegram API under load
+                fut.result(timeout=15)
+            except Exception as e:
+                # On timeout or cancellation, attempt to cancel and log at warning level
+                try:
+                    fut.cancel()
+                except Exception:
+                    pass
+                logger.warning(f"Telegram notify timed out/cancelled for chat {chat_id}: {e}")
+                return
         except Exception:
             logger.exception("Failed to send Telegram notification")
 

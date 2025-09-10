@@ -94,8 +94,9 @@ class TrendFollowingStrategy:
             
             # Generate signals
             signal = self._generate_signal(
-                trend, pullback_signal, higher_highs, lower_lows, 
-                current_rsi, current_price, current_fast_ma, current_slow_ma
+                trend, pullback_signal, higher_highs, lower_lows,
+                current_rsi, current_price, current_fast_ma, current_slow_ma,
+                df
             )
             
             return {
@@ -163,9 +164,9 @@ class TrendFollowingStrategy:
         
         return {'type': 'no_pullback'}
     
-    def _generate_signal(self, trend: str, pullback_signal: Dict, higher_highs: bool, 
-                        lower_lows: bool, rsi: float, current_price: float, 
-                        fast_ma: float, slow_ma: float) -> Dict:
+    def _generate_signal(self, trend: str, pullback_signal: Dict, higher_highs: bool,
+                        lower_lows: bool, rsi: float, current_price: float,
+                        fast_ma: float, slow_ma: float, df) -> Dict:
         """
         Generate trading signal based on analysis
         
@@ -178,6 +179,7 @@ class TrendFollowingStrategy:
             current_price: Current price
             fast_ma: Fast MA value
             slow_ma: Slow MA value
+            df: OHLC DataFrame used for analysis
             
         Returns:
             Dict: Trading signal
@@ -190,14 +192,20 @@ class TrendFollowingStrategy:
             rsi > 30):  # Not oversold
             
             # Calculate stop loss and take profit
-            if PANDAS_AVAILABLE:
-                atr = TechnicalIndicators.atr(
-                    pd.Series([current_price]), 
-                    pd.Series([current_price * 0.999]), 
-                    pd.Series([current_price])
-                ).iloc[-1] if len(pd.Series([current_price])) > 0 else current_price * 0.01
+            atr_period = 14
+            if PANDAS_AVAILABLE and len(df) >= atr_period:
+                try:
+                    atr_series = TechnicalIndicators.atr(
+                        df['high'].tail(atr_period * 3),
+                        df['low'].tail(atr_period * 3),
+                        df['close'].tail(atr_period * 3),
+                        period=atr_period,
+                    )
+                    atr = float(atr_series.iloc[-1]) if not pd.isna(atr_series.iloc[-1]) else current_price * 0.01
+                except Exception:
+                    atr = current_price * 0.01
             else:
-                atr = current_price * 0.01  # Simple fallback
+                atr = current_price * 0.01  # Fallback when insufficient history
             
             stop_loss = RiskManagement.calculate_stop_loss(current_price, 'buy', atr, 1.5)
             take_profit = RiskManagement.calculate_take_profit(current_price, stop_loss, 'buy', 2.0)
@@ -219,14 +227,20 @@ class TrendFollowingStrategy:
               rsi < 70):  # Not overbought
             
             # Calculate stop loss and take profit
-            if PANDAS_AVAILABLE:
-                atr = TechnicalIndicators.atr(
-                    pd.Series([current_price]), 
-                    pd.Series([current_price * 1.001]), 
-                    pd.Series([current_price])
-                ).iloc[-1] if len(pd.Series([current_price])) > 0 else current_price * 0.01
+            atr_period = 14
+            if PANDAS_AVAILABLE and len(df) >= atr_period:
+                try:
+                    atr_series = TechnicalIndicators.atr(
+                        df['high'].tail(atr_period * 3),
+                        df['low'].tail(atr_period * 3),
+                        df['close'].tail(atr_period * 3),
+                        period=atr_period,
+                    )
+                    atr = float(atr_series.iloc[-1]) if not pd.isna(atr_series.iloc[-1]) else current_price * 0.01
+                except Exception:
+                    atr = current_price * 0.01
             else:
-                atr = current_price * 0.01  # Simple fallback
+                atr = current_price * 0.01  # Fallback when insufficient history
             
             stop_loss = RiskManagement.calculate_stop_loss(current_price, 'sell', atr, 1.5)
             take_profit = RiskManagement.calculate_take_profit(current_price, stop_loss, 'sell', 2.0)

@@ -67,7 +67,16 @@ except ImportError as e:
     PANDAS_AVAILABLE = False
     pd = None
 
-# AI components removed - bot now runs with traditional strategies only
+# AI components
+try:
+    from ai import AIStrategy, AutoTrainer, AITelegramBot
+    AI_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"AI components not available: {e}")
+    AI_AVAILABLE = False
+    AIStrategy = None
+    AutoTrainer = None
+    AITelegramBot = None
 
 # Import Telegram bot components for buttons
 try:
@@ -85,30 +94,64 @@ except ImportError as e:
     CommandHandler = None
 
 if TELEGRAM_BOT_AVAILABLE and TELEGRAM_COMPONENTS_AVAILABLE:
-    class StandardTelegramBot(TelegramBot):
+    class AITelegramBotWrapper(TelegramBot):
         """
-        Standard Telegram Bot
+        AI-Enhanced Telegram Bot
         
-        This is the standard Telegram bot without AI capabilities.
+        This is the AI-enhanced Telegram bot with advanced machine learning capabilities.
         """
     
         def __init__(self, mt5_connector, controller):
-            """Initialize standard Telegram bot."""
+            """Initialize AI-enhanced Telegram bot."""
             super().__init__(mt5_connector, controller)
-            logger.info("Standard Telegram Bot initialized")
+            self.ai_strategy = None
+            self.auto_trainer = None
+            self.ai_telegram_bot = None
+            
+            # Initialize AI components if available
+            if AI_AVAILABLE:
+                try:
+                    self.ai_strategy = AIStrategy(mt5_connector)
+                    self.auto_trainer = AutoTrainer(self.ai_strategy, mt5_connector)
+                    self.ai_telegram_bot = AITelegramBot(self, self.ai_strategy, self.auto_trainer)
+                    logger.info("AI components initialized")
+                except Exception as e:
+                    logger.error(f"Failed to initialize AI components: {e}")
+                    self.ai_strategy = None
+                    self.auto_trainer = None
+                    self.ai_telegram_bot = None
+            
+            logger.info("AI-Enhanced Telegram Bot initialized")
     
         def setup_commands(self):
-            """Setup Telegram bot commands."""
-            logger.info("Standard Telegram bot commands setup")
+            """Setup Telegram bot commands including AI commands."""
+            logger.info("Setting up AI-enhanced Telegram bot commands")
+            
+            # Setup base commands (this will be done in the parent class)
+            # We'll add AI commands in the _run_blocking method
     
-    
-    def start(self):
-        """Start the standard Telegram bot."""
-        # Setup commands
-        self.setup_commands()
+        def start(self):
+            """Start the AI-enhanced Telegram bot."""
+            # Start auto-trainer if available
+            if self.auto_trainer:
+                self.auto_trainer.start_auto_training()
+                logger.info("AI auto-trainer started")
+            
+            # Start parent bot
+            super().start()
         
-        # Start parent bot
-        super().start()
+        def stop(self):
+            """Stop the AI-enhanced Telegram bot."""
+            # Stop auto-trainer if available
+            if self.auto_trainer:
+                self.auto_trainer.stop_auto_training()
+                logger.info("AI auto-trainer stopped")
+            
+            # Stop parent bot
+            super().stop()
+    
+    # Use AI-enhanced bot as the main bot
+    StandardTelegramBot = AITelegramBotWrapper
     
 else:
     # Create a dummy StandardTelegramBot class when Telegram is not available
@@ -146,6 +189,16 @@ class PriceActionTradingBot:
         # Initialize strategies
         self._initialize_strategies()
         
+        # Initialize AI strategy if available
+        self.ai_strategy = None
+        if AI_AVAILABLE and self.mt5:
+            try:
+                self.ai_strategy = AIStrategy(self.mt5)
+                self.strategies.append(self.ai_strategy)
+                logger.info("AI Strategy initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize AI strategy: {e}")
+        
         # Trading statistics
         self.stats = {
             'total_trades': 0,
@@ -155,6 +208,9 @@ class PriceActionTradingBot:
             'daily_trades': 0,
             'session_start': self.session_start_time
         }
+        
+        # Close reasons tracking
+        self.close_reasons = []
         
     def _initialize_strategies(self):
         """Initialize all trading strategies"""
@@ -530,8 +586,11 @@ class PriceActionTradingBot:
                 exit_analysis = strategy.should_exit_position(position, df)
                 
                 if exit_analysis.get('exit', False):
-                    # Close position
-                    if self.mt5.close_position(position['ticket']):
+                    # Get close reason
+                    close_reason = exit_analysis.get('reason', 'Unknown reason')
+                    
+                    # Close position with reason
+                    if self.mt5.close_position(position['ticket'], close_reason):
                         profit = position['profit']
                         self.stats['total_profit'] += profit
                         
@@ -540,14 +599,28 @@ class PriceActionTradingBot:
                         else:
                             self.stats['losing_trades'] += 1
                         
-                        logger.info(f"Position closed: {position['ticket']}, Profit: {profit}")
-                        logger.info(f"Reason: {exit_analysis['reason']}")
+                        logger.info(f"Position closed: {position['ticket']}, Profit: {profit:.2f}")
+                        logger.info(f"Close reason: {close_reason}")
+                        
+                        # Track close reason
+                        self.close_reasons.append({
+                            'ticket': position['ticket'],
+                            'symbol': position['symbol'],
+                            'type': position['type'],
+                            'profit': profit,
+                            'reason': close_reason,
+                            'timestamp': datetime.now(),
+                            'strategy': strategy.__class__.__name__
+                        })
                         
                         # Send notification if enabled
                         if TELEGRAM_ENABLED and self.telegram_bot:
                             try:
+                                profit_emoji = "💰" if profit > 0 else "📉"
                                 self._notify_subscribers(
-                                    f"ℹ️ Position closed #{position['ticket']} | P/L: {profit:.2f}"
+                                    f"{profit_emoji} Position closed #{position['ticket']}\n"
+                                    f"P/L: {profit:.2f}\n"
+                                    f"Reason: {close_reason}"
                                 )
                             except Exception:
                                 logger.exception("Failed to notify position close")
@@ -605,6 +678,46 @@ class PriceActionTradingBot:
         except Exception as e:
             logger.error(f"Error updating statistics: {e}")
     
+    def get_close_reasons_stats(self) -> Dict:
+        """Get close reasons statistics"""
+        if not self.close_reasons:
+            return {'total_closes': 0, 'reasons': {}}
+        
+        # Count reasons
+        reason_counts = {}
+        strategy_counts = {}
+        profit_by_reason = {}
+        
+        for close in self.close_reasons:
+            reason = close['reason']
+            strategy = close['strategy']
+            profit = close['profit']
+            
+            # Count reasons
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            
+            # Count by strategy
+            strategy_counts[strategy] = strategy_counts.get(strategy, 0) + 1
+            
+            # Profit by reason
+            if reason not in profit_by_reason:
+                profit_by_reason[reason] = {'total': 0, 'count': 0}
+            profit_by_reason[reason]['total'] += profit
+            profit_by_reason[reason]['count'] += 1
+        
+        # Calculate average profit by reason
+        avg_profit_by_reason = {}
+        for reason, data in profit_by_reason.items():
+            avg_profit_by_reason[reason] = data['total'] / data['count']
+        
+        return {
+            'total_closes': len(self.close_reasons),
+            'reasons': reason_counts,
+            'strategies': strategy_counts,
+            'avg_profit_by_reason': avg_profit_by_reason,
+            'recent_closes': self.close_reasons[-5:] if len(self.close_reasons) > 5 else self.close_reasons
+        }
+    
     def _send_telegram_notification(self, message: str):
         """Send Telegram notification"""
         if not TELEGRAM_ENABLED or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -617,7 +730,8 @@ class PriceActionTradingBot:
             data = {
                 'chat_id': TELEGRAM_CHAT_ID,
                 'text': f"🤖 Price Action Bot\n{message}",
-                'parse_mode': 'HTML'
+                'parse_mode': 'HTML',
+                'disable_web_page_preview': True
             }
             
             response = requests.post(url, data=data, timeout=10)
