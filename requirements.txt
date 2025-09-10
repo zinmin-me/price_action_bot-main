@@ -1,0 +1,26 @@
+# Stable Price Action Bot + MT5 + AI
+
+# Core Trading Dependencies
+MetaTrader5==5.0.45
+numpy==1.23.5
+pandas==2.1.4
+python-telegram-bot==20.7
+python-dotenv==1.0.0
+ta==0.10.2
+matplotlib==3.8.2
+seaborn==0.13.0
+schedule==1.2.0
+requests==2.31.0
+
+# AI/ML Core Libraries
+scikit-learn==1.3.2
+scipy==1.9.3
+
+# Deep Learning / AI
+tensorflow>=2.10.0
+textblob==0.17.1
+transformers>=4.20.0
+
+# Model Persistence & Configuration
+joblib>=1.1.0
+pyyaml>=6.0
