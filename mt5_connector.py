@@ -459,7 +459,7 @@ class MT5Connector:
             
             request = {
                 "action": mt5.TRADE_ACTION_PENDING,
-                "symbol": SYMBOL,
+                "symbol": self._symbol,
                 "volume": volume,
                 "type": order_type_mapping[order_type],
                 "price": price,
@@ -474,12 +474,13 @@ class MT5Connector:
             
             # Send order
             result = mt5.order_send(request)
-            
-            if result.retcode != mt5.TRADE_RETCODE_DONE:
-                logger.error(f"Pending order failed: {result.retcode} - {result.comment}")
+            if result is None or getattr(result, 'retcode', None) != mt5.TRADE_RETCODE_DONE:
+                ret = getattr(result, 'retcode', None) if result is not None else None
+                comment_text = getattr(result, 'comment', '') if result is not None else ''
+                logger.error(f"Pending order failed: {ret} - {comment_text} last_error={mt5.last_error()}")
                 return None
-            
-            logger.info(f"Pending order placed: {order_type} {volume} {SYMBOL} at {price}")
+
+            logger.info(f"Pending order placed: {order_type} {volume} {self._symbol} at {price}")
             return {
                 'retcode': result.retcode,
                 'deal': result.deal,
@@ -598,13 +599,17 @@ class MT5Connector:
             
             position = positions[0]
             
-            # Prepare close request
+            # Prepare close request (with tick availability check)
+            tick = mt5.symbol_info_tick(position.symbol)
+            if tick is None:
+                logger.error(f"No tick data available for symbol {position.symbol} while closing position {ticket}")
+                return False
             if position.type == 0:  # Buy position
                 order_type = mt5.ORDER_TYPE_SELL
-                price = mt5.symbol_info_tick(position.symbol).bid
+                price = tick.bid
             else:  # Sell position
                 order_type = mt5.ORDER_TYPE_BUY
-                price = mt5.symbol_info_tick(position.symbol).ask
+                price = tick.ask
             
             request = {
                 "action": mt5.TRADE_ACTION_DEAL,
@@ -615,16 +620,17 @@ class MT5Connector:
                 "price": price,
                 "deviation": 20,
                 "magic": position.magic,
-                "comment": f"Close: {reason}",
+                "comment": self._sanitize_comment(f"Close: {reason}"),
                 "type_time": mt5.ORDER_TIME_GTC,
                 "type_filling": mt5.ORDER_FILLING_IOC,
             }
             
             # Send close request
             result = mt5.order_send(request)
-            
-            if result.retcode != mt5.TRADE_RETCODE_DONE:
-                logger.error(f"Failed to close position {ticket}: {result.retcode} - {result.comment}")
+            if result is None or getattr(result, 'retcode', None) != mt5.TRADE_RETCODE_DONE:
+                ret = getattr(result, 'retcode', None) if result is not None else None
+                comment_text = getattr(result, 'comment', '') if result is not None else ''
+                logger.error(f"Failed to close position {ticket}: {ret} - {comment_text} last_error={mt5.last_error()}")
                 return False
             
             logger.info(f"Position {ticket} closed successfully - Reason: {reason}")
@@ -732,9 +738,10 @@ class MT5Connector:
             }
             
             result = mt5.order_send(request)
-            
-            if result.retcode != mt5.TRADE_RETCODE_DONE:
-                logger.error(f"Failed to cancel order {ticket}: {result.retcode} - {result.comment}")
+            if result is None or getattr(result, 'retcode', None) != mt5.TRADE_RETCODE_DONE:
+                ret = getattr(result, 'retcode', None) if result is not None else None
+                comment_text = getattr(result, 'comment', '') if result is not None else ''
+                logger.error(f"Failed to cancel order {ticket}: {ret} - {comment_text} last_error={mt5.last_error()}")
                 return False
             
             logger.info(f"Order {ticket} cancelled successfully")
