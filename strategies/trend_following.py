@@ -18,6 +18,11 @@ import logging
 from datetime import datetime
 
 from config import *
+from ta.trend import MACD, EMAIndicator
+from ta.momentum import StochasticOscillator
+from ta.volatility import BollingerBands
+from ta.volume import OnBalanceVolumeIndicator
+from ta.trend import EMAIndicator
 from utils import TechnicalIndicators, TrendAnalysis, RiskManagement, LoggingUtils
 
 logger = logging.getLogger(__name__)
@@ -60,6 +65,46 @@ class TrendFollowingStrategy:
             fast_ma = TechnicalIndicators.sma(df['close'], self.fast_ma_period)
             slow_ma = TechnicalIndicators.sma(df['close'], self.slow_ma_period)
             rsi = TechnicalIndicators.rsi(df['close'], self.rsi_period)
+            macd_line = macd_signal = macd_hist = None
+            stoch_k = stoch_d = None
+            bb_high = bb_low = None
+            ema9 = ema20 = ema50 = ema200 = None
+            vwap = None
+            rsi_fast = None
+            obv = None
+            try:
+                if INDICATORS_ENABLE_MACD and PANDAS_AVAILABLE:
+                    macd = MACD(close=df['close'], window_fast=MACD_FAST, window_slow=MACD_SLOW, window_sign=MACD_SIGNAL)
+                    macd_line = macd.macd()
+                    macd_signal = macd.macd_signal()
+                    macd_hist = macd.macd_diff()
+                if INDICATORS_ENABLE_STOCH and PANDAS_AVAILABLE:
+                    stoch = StochasticOscillator(high=df['high'], low=df['low'], close=df['close'], window=STOCH_K, smooth_window=STOCH_SMOOTH)
+                    stoch_k = stoch.stoch()
+                    stoch_d = stoch.stoch_signal() if hasattr(stoch, 'stoch_signal') else stoch_k.rolling(STOCH_D).mean()
+                if INDICATORS_ENABLE_BB and PANDAS_AVAILABLE:
+                    bb = BollingerBands(close=df['close'], window=BB_PERIOD, window_dev=BB_STD)
+                    bb_high = bb.bollinger_hband()
+                    bb_low = bb.bollinger_lband()
+                # EMA 9/20/50/200
+                if PANDAS_AVAILABLE:
+                    ema9 = EMAIndicator(close=df['close'], window=EMA_FAST_SHORT).ema_indicator()
+                    ema20 = EMAIndicator(close=df['close'], window=EMA_SLOW_SHORT).ema_indicator()
+                    ema50 = EMAIndicator(close=df['close'], window=EMA_MEDIUM).ema_indicator()
+                    ema200 = EMAIndicator(close=df['close'], window=EMA_LONG).ema_indicator()
+                # VWAP (approx using cumulative typical price * volume / cumulative volume if volume available)
+                if VWAP_ENABLED and PANDAS_AVAILABLE and 'tick_volume' in df.columns:
+                    tp = (df['high'] + df['low'] + df['close']) / 3.0
+                    cum_v = df['tick_volume'].cumsum().replace(0, np.nan)
+                    vwap = (tp * df['tick_volume']).cumsum() / cum_v
+                # Fast RSI
+                if PANDAS_AVAILABLE:
+                    rsi_fast = TechnicalIndicators.rsi(df['close'], RSI_FAST_PERIOD)
+                # OBV
+                if OBV_ENABLED and PANDAS_AVAILABLE and 'tick_volume' in df.columns:
+                    obv = OnBalanceVolumeIndicator(close=df['close'], volume=df['tick_volume']).on_balance_volume()
+            except Exception:
+                pass
             # Guard against NaNs or insufficient computed points
             if PANDAS_AVAILABLE:
                 if (
@@ -92,11 +137,50 @@ class TrendFollowingStrategy:
             except Exception:
                 higher_highs, lower_lows = False, False
             
+            # Additional indicator gates
+            indicator_ok = True
+            try:
+                if INDICATORS_ENABLE_MACD and macd_line is not None and macd_signal is not None:
+                    # For longs prefer MACD above signal; for shorts below
+                    pass  # decision made later per direction
+                if INDICATORS_ENABLE_STOCH and stoch_k is not None:
+                    # Avoid long entries if stoch overbought; avoid shorts if oversold
+                    pass
+                if INDICATORS_ENABLE_BB and bb_high is not None and bb_low is not None:
+                    # Optional: avoid entries when price outside bands (exhaustion)
+                    pass
+            except Exception:
+                indicator_ok = True
+
+            # Higher timeframe EMA confirmation (optional)
+            if HTF_CONFIRM_ENABLED and PANDAS_AVAILABLE:
+                try:
+                    # Fetch HTF data via connector if available
+                    htf_map = TIMEFRAME_MAPPING.get(HTF_TIMEFRAME, None)
+                    if htf_map:
+                        htf_df = self.mt5.get_rates(self.mt5.get_symbol(), HTF_TIMEFRAME, 400)
+                        if htf_df is not None and len(htf_df) >= EMA_LONG + 5:
+                            htf_ema50 = EMAIndicator(close=htf_df['close'], window=EMA_MEDIUM).ema_indicator()
+                            htf_ema200 = EMAIndicator(close=htf_df['close'], window=EMA_LONG).ema_indicator()
+                            self._htf_bull = htf_ema50.iloc[-1] > htf_ema200.iloc[-1]
+                            self._htf_bear = htf_ema50.iloc[-1] < htf_ema200.iloc[-1]
+                        else:
+                            self._htf_bull = self._htf_bear = False
+                    else:
+                        self._htf_bull = self._htf_bear = False
+                except Exception:
+                    self._htf_bull = self._htf_bear = False
+
             # Generate signals
             signal = self._generate_signal(
                 trend, pullback_signal, higher_highs, lower_lows,
                 current_rsi, current_price, current_fast_ma, current_slow_ma,
-                df
+                df,
+                macd_line=macd_line, macd_signal=macd_signal, macd_hist=macd_hist,
+                stoch_k=stoch_k, stoch_d=stoch_d,
+                bb_high=bb_high, bb_low=bb_low,
+                ema9=ema9, ema20=ema20, ema50=ema50, ema200=ema200,
+                vwap=vwap, rsi_fast=rsi_fast, obv=obv
             )
             
             return {
@@ -166,7 +250,12 @@ class TrendFollowingStrategy:
     
     def _generate_signal(self, trend: str, pullback_signal: Dict, higher_highs: bool,
                         lower_lows: bool, rsi: float, current_price: float,
-                        fast_ma: float, slow_ma: float, df) -> Dict:
+                        fast_ma: float, slow_ma: float, df,
+                        macd_line=None, macd_signal=None, macd_hist=None,
+                        stoch_k=None, stoch_d=None,
+                        bb_high=None, bb_low=None,
+                        ema9=None, ema20=None, ema50=None, ema200=None,
+                        vwap=None, rsi_fast=None, obv=None) -> Dict:
         """
         Generate trading signal based on analysis
         
@@ -191,6 +280,55 @@ class TrendFollowingStrategy:
             rsi < self.rsi_overbought and
             rsi > 30):  # Not oversold
             
+            # HTF confirmation
+            if HTF_CONFIRM_ENABLED:
+                if not getattr(self, '_htf_bull', False):
+                    return {'type': 'no_signal', 'reason': 'HTF not bullish'}
+
+            # Indicator gates for long
+            if INDICATORS_ENABLE_MACD and macd_line is not None and macd_signal is not None:
+                try:
+                    if pd.isna(macd_line.iloc[-1]) or pd.isna(macd_signal.iloc[-1]) or macd_line.iloc[-1] <= macd_signal.iloc[-1]:
+                        return {'type': 'no_signal', 'reason': 'MACD not supportive'}
+                except Exception:
+                    pass
+            # EMA alignment: price above EMA9>EMA20 and above EMA50 if available
+            try:
+                if ema9 is not None and ema20 is not None:
+                    if ema9.iloc[-1] <= ema20.iloc[-1] or current_price <= ema9.iloc[-1]:
+                        return {'type': 'no_signal', 'reason': 'EMA9/20 not aligned'}
+                if ema50 is not None and current_price <= ema50.iloc[-1]:
+                    return {'type': 'no_signal', 'reason': 'Below EMA50'}
+                if ema200 is not None and ema50 is not None and ema50.iloc[-1] <= ema200.iloc[-1]:
+                    # Higher timeframe filter: medium above long
+                    return {'type': 'no_signal', 'reason': 'EMA50<EMA200'}
+            except Exception:
+                pass
+            if INDICATORS_ENABLE_STOCH and stoch_k is not None:
+                try:
+                    if stoch_k.iloc[-1] >= STOCH_OVERBOUGHT:
+                        return {'type': 'no_signal', 'reason': 'Stoch overbought'}
+                except Exception:
+                    pass
+            if INDICATORS_ENABLE_BB and bb_high is not None and bb_low is not None:
+                try:
+                    if current_price > bb_high.iloc[-1]:
+                        return {'type': 'no_signal', 'reason': 'Price above BB'}
+                except Exception:
+                    pass
+            # VWAP support: prefer price above VWAP for longs
+            try:
+                if vwap is not None and current_price < vwap.iloc[-1]:
+                    return {'type': 'no_signal', 'reason': 'Below VWAP'}
+            except Exception:
+                pass
+            # Fast RSI confirmation (avoid buying when already hot)
+            try:
+                if rsi_fast is not None and not pd.isna(rsi_fast.iloc[-1]) and rsi_fast.iloc[-1] > 75:
+                    return {'type': 'no_signal', 'reason': 'Fast RSI too high'}
+            except Exception:
+                pass
+
             # Calculate stop loss and take profit
             atr_period = 14
             if PANDAS_AVAILABLE and len(df) >= atr_period:
@@ -226,6 +364,53 @@ class TrendFollowingStrategy:
               rsi > self.rsi_oversold and
               rsi < 70):  # Not overbought
             
+            if HTF_CONFIRM_ENABLED:
+                if not getattr(self, '_htf_bear', False):
+                    return {'type': 'no_signal', 'reason': 'HTF not bearish'}
+
+            # Indicator gates for short
+            if INDICATORS_ENABLE_MACD and macd_line is not None and macd_signal is not None:
+                try:
+                    if pd.isna(macd_line.iloc[-1]) or pd.isna(macd_signal.iloc[-1]) or macd_line.iloc[-1] >= macd_signal.iloc[-1]:
+                        return {'type': 'no_signal', 'reason': 'MACD not supportive'}
+                except Exception:
+                    pass
+            # EMA alignment: price below EMA9<EMA20 and below EMA50
+            try:
+                if ema9 is not None and ema20 is not None:
+                    if ema9.iloc[-1] >= ema20.iloc[-1] or current_price >= ema9.iloc[-1]:
+                        return {'type': 'no_signal', 'reason': 'EMA9/20 not aligned'}
+                if ema50 is not None and current_price >= ema50.iloc[-1]:
+                    return {'type': 'no_signal', 'reason': 'Above EMA50'}
+                if ema200 is not None and ema50 is not None and ema50.iloc[-1] >= ema200.iloc[-1]:
+                    return {'type': 'no_signal', 'reason': 'EMA50>EMA200'}
+            except Exception:
+                pass
+            if INDICATORS_ENABLE_STOCH and stoch_k is not None:
+                try:
+                    if stoch_k.iloc[-1] <= STOCH_OVERSOLD:
+                        return {'type': 'no_signal', 'reason': 'Stoch oversold'}
+                except Exception:
+                    pass
+            if INDICATORS_ENABLE_BB and bb_high is not None and bb_low is not None:
+                try:
+                    if current_price < bb_low.iloc[-1]:
+                        return {'type': 'no_signal', 'reason': 'Price below BB'}
+                except Exception:
+                    pass
+            # VWAP: prefer price below VWAP for shorts
+            try:
+                if vwap is not None and current_price > vwap.iloc[-1]:
+                    return {'type': 'no_signal', 'reason': 'Above VWAP'}
+            except Exception:
+                pass
+            # Fast RSI confirmation (avoid selling when already washed out)
+            try:
+                if rsi_fast is not None and not pd.isna(rsi_fast.iloc[-1]) and rsi_fast.iloc[-1] < 25:
+                    return {'type': 'no_signal', 'reason': 'Fast RSI too low'}
+            except Exception:
+                pass
+
             # Calculate stop loss and take profit
             atr_period = 14
             if PANDAS_AVAILABLE and len(df) >= atr_period:

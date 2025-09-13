@@ -5,6 +5,15 @@ Handles all MT5 API interactions including connection, data retrieval, and order
 
 import MetaTrader5 as mt5
 import numpy as np
+import os
+import time
+import subprocess
+try:
+    import psutil  # optional
+    _PSUTIL_AVAILABLE = True
+except ImportError:
+    psutil = None
+    _PSUTIL_AVAILABLE = False
 
 try:
     import pandas as pd
@@ -23,10 +32,138 @@ from config import *
 logging.basicConfig(level=getattr(logging, LOG_LEVEL))
 logger = logging.getLogger(__name__)
 
+# Global registry to track all MT5Connector instances
+_active_connectors = []
+
+class MT5Troubleshooter:
+    """MT5 connection troubleshooting utilities"""
+    
+    @staticmethod
+    def find_mt5_installations() -> List[str]:
+        """Find all possible MT5 installation paths"""
+        possible_paths = [
+            r"C:\Program Files\MetaTrader 5\terminal64.exe",
+            r"C:\Program Files (x86)\MetaTrader 5\terminal64.exe",
+            r"C:\Program Files\MetaTrader 5\terminal.exe",
+            r"C:\Program Files (x86)\MetaTrader 5\terminal.exe"
+        ]
+        
+        # Add user-specific paths
+        username = os.getenv('USERNAME', '')
+        if username:
+            user_paths = [
+                rf"C:\Users\{username}\AppData\Roaming\MetaQuotes\Terminal\*\terminal64.exe",
+                rf"C:\Users\{username}\AppData\Roaming\MetaQuotes\Terminal\*\terminal.exe"
+            ]
+            possible_paths.extend(user_paths)
+        
+        valid_paths = []
+        for path in possible_paths:
+            if '*' in path:
+                # Handle wildcard paths
+                import glob
+                matches = glob.glob(path)
+                valid_paths.extend(matches)
+            elif os.path.exists(path):
+                valid_paths.append(path)
+        
+        return valid_paths
+    
+    @staticmethod
+    def is_mt5_running() -> bool:
+        """Check if MT5 terminal is currently running"""
+        if not _PSUTIL_AVAILABLE:
+            logger.warning("psutil not available; skipping MT5 running check")
+            return False
+        try:
+            for proc in psutil.process_iter(['pid', 'name']):
+                if proc.info['name'] and 'terminal' in proc.info['name'].lower():
+                    return True
+            return False
+        except Exception:
+            return False
+    
+    @staticmethod
+    def kill_mt5_processes():
+        """Kill all running MT5 processes"""
+        if not _PSUTIL_AVAILABLE:
+            logger.warning("psutil not available; cannot kill MT5 processes")
+            return False
+        try:
+            killed_count = 0
+            for proc in psutil.process_iter(['pid', 'name']):
+                if proc.info['name'] and 'terminal' in proc.info['name'].lower():
+                    try:
+                        proc.kill()
+                        killed_count += 1
+                        logger.info(f"Killed MT5 process: {proc.info['name']} (PID: {proc.info['pid']})")
+                    except Exception as e:
+                        logger.warning(f"Could not kill MT5 process {proc.info['pid']}: {e}")
+            if killed_count > 0:
+                logger.info(f"Killed {killed_count} MT5 processes")
+                time.sleep(2)  # Wait for processes to fully terminate
+            return killed_count > 0
+        except Exception as e:
+            logger.error(f"Error killing MT5 processes: {e}")
+            return False
+    
+    @staticmethod
+    def start_mt5_terminal(terminal_path: str) -> bool:
+        """Start MT5 terminal if not running"""
+        try:
+            if MT5Troubleshooter.is_mt5_running():
+                logger.info("MT5 terminal is already running")
+                return True
+            
+            if not os.path.exists(terminal_path):
+                logger.error(f"MT5 terminal not found at: {terminal_path}")
+                return False
+            
+            logger.info(f"Starting MT5 terminal: {terminal_path}")
+            subprocess.Popen([terminal_path], shell=True)
+            time.sleep(5)  # Wait for terminal to start
+            return True
+        except Exception as e:
+            logger.error(f"Error starting MT5 terminal: {e}")
+            return False
+    
+    @staticmethod
+    def diagnose_connection_issue() -> Dict:
+        """Diagnose common MT5 connection issues"""
+        diagnosis = {
+            'mt5_installed': False,
+            'mt5_running': False,
+            'valid_paths': [],
+            'recommendations': []
+        }
+        
+        # Check for MT5 installations
+        valid_paths = MT5Troubleshooter.find_mt5_installations()
+        diagnosis['valid_paths'] = valid_paths
+        diagnosis['mt5_installed'] = len(valid_paths) > 0
+        
+        # Check if MT5 is running
+        diagnosis['mt5_running'] = MT5Troubleshooter.is_mt5_running()
+        
+        # Generate recommendations
+        if not diagnosis['mt5_installed']:
+            diagnosis['recommendations'].append("Install MetaTrader 5 terminal")
+        elif not diagnosis['mt5_running']:
+            diagnosis['recommendations'].append("Start MetaTrader 5 terminal manually")
+            if valid_paths:
+                diagnosis['recommendations'].append(f"Try starting: {valid_paths[0]}")
+        else:
+            diagnosis['recommendations'].append("MT5 is running - check credentials and server")
+            diagnosis['recommendations'].append("Ensure MT5 is logged in to your account")
+            diagnosis['recommendations'].append("Check if MT5 is in demo/live mode as expected")
+        
+        return diagnosis
+
 class MT5Connector:
     """MetaTrader 5 connection and trading operations handler.
 
     Supports per-instance credentials and symbol/timeframe overrides for multi-account usage.
+    Each instance maintains its own connection state and credentials.
     """
     
     def __init__(self, login: int = None, password: str = None, server: str = None,
@@ -41,57 +178,235 @@ class MT5Connector:
         self._terminal_path = terminal_path if terminal_path is not None else MT5_PATH
         self._symbol = symbol if symbol is not None else SYMBOL
         self._timeframe = timeframe if timeframe is not None else TIMEFRAME
+        # Track if this instance is currently active (connected to MT5)
+        self._is_active = False
+        # Store last MT5 error (code, description)
+        self._last_error = None
+        # Register this instance globally
+        _active_connectors.append(self)
         
-    def connect(self) -> bool:
+    def connect(self, max_retries: int = 3, retry_delay: int = 5) -> bool:
         """
-        Establish connection to MetaTrader 5
+        Establish connection to MetaTrader 5 with retry logic and troubleshooting
         
+        Args:
+            max_retries: Maximum number of connection attempts
+            retry_delay: Delay between retry attempts in seconds
+            
         Returns:
             bool: True if connection successful, False otherwise
         """
-        try:
-            # Initialize MT5
-            if not mt5.initialize(path=self._terminal_path):
-                logger.error(f"MT5 initialization failed: {mt5.last_error()}")
-                return False
-            
-            # Login to account
-            if not mt5.login(login=self._login, password=self._password, server=self._server):
-                logger.error(f"MT5 login failed: {mt5.last_error()}")
-                return False
-            
-            # Get account info
-            self.account_info = mt5.account_info()
-            if self.account_info is None:
-                logger.error("Failed to get account info")
-                return False
-            
-            # Get symbol info
-            self.symbol_info = mt5.symbol_info(self._symbol)
-            if self.symbol_info is None:
-                logger.error(f"Failed to get symbol info for {self._symbol}")
-                return False
-            
-            # Enable symbol for trading
-            if not mt5.symbol_select(self._symbol, True):
-                logger.error(f"Failed to select symbol {self._symbol}")
-                return False
-            
-            self.connected = True
-            logger.info(f"Successfully connected to MT5. Account: {self.account_info.login}")
-            logger.info(f"Balance: {self.account_info.balance}, Equity: {self.account_info.equity}")
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Connection error: {e}")
-            return False
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"MT5 connection attempt {attempt + 1}/{max_retries}")
+                
+                # Check if MT5 terminal is running
+                if not MT5Troubleshooter.is_mt5_running():
+                    logger.warning("MT5 terminal is not running, attempting to start...")
+                    if not MT5Troubleshooter.start_mt5_terminal(self._terminal_path):
+                        logger.error("Failed to start MT5 terminal")
+                        if attempt < max_retries - 1:
+                            time.sleep(retry_delay)
+                            continue
+                        else:
+                            # Final attempt - try to diagnose the issue
+                            diagnosis = MT5Troubleshooter.diagnose_connection_issue()
+                            logger.error("MT5 Connection Diagnosis:")
+                            logger.error(f"  MT5 Installed: {diagnosis['mt5_installed']}")
+                            logger.error(f"  MT5 Running: {diagnosis['mt5_running']}")
+                            logger.error(f"  Valid Paths: {diagnosis['valid_paths']}")
+                            logger.error("  Recommendations:")
+                            for rec in diagnosis['recommendations']:
+                                logger.error(f"    - {rec}")
+                            return False
+                
+                # Try to initialize MT5
+                if not mt5.initialize(path=self._terminal_path):
+                    error_code, error_desc = mt5.last_error()
+                    self._last_error = (error_code, error_desc)
+                    logger.error(f"MT5 initialization failed (attempt {attempt + 1}): {error_code} - {error_desc}")
+                    
+                    # Handle specific error codes
+                    if error_code == -10005:  # IPC timeout
+                        logger.warning("IPC timeout detected - this usually means MT5 is not responding")
+                        if attempt < max_retries - 1:
+                            logger.info(f"Waiting {retry_delay} seconds before retry...")
+                            time.sleep(retry_delay)
+                            continue
+                    elif error_code == -10004:  # Common initialization error
+                        logger.warning("MT5 initialization error - trying to restart terminal")
+                        MT5Troubleshooter.kill_mt5_processes()
+                        time.sleep(3)
+                        if not MT5Troubleshooter.start_mt5_terminal(self._terminal_path):
+                            logger.error("Failed to restart MT5 terminal")
+                            if attempt < max_retries - 1:
+                                time.sleep(retry_delay)
+                                continue
+                    
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        return False
+                
+                # Check if already connected to the same account
+                current_account = mt5.account_info()
+                if current_account and current_account.login == self._login:
+                    logger.info(f"Already connected to account {self._login}")
+                    self.connected = True
+                    self._is_active = True
+                    self.account_info = current_account
+                    
+                    # Mark all other connectors as inactive
+                    for connector in _active_connectors:
+                        if connector != self:
+                            connector._is_active = False
+                            connector.connected = False
+                    
+                    return True
+                
+                # Login to account (this will disconnect any existing connection)
+                if not mt5.login(login=self._login, password=self._password, server=self._server):
+                    self._last_error = mt5.last_error()
+                    logger.error(f"MT5 login failed: {self._last_error}")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        return False
+                
+                # Get account info
+                self.account_info = mt5.account_info()
+                if self.account_info is None:
+                    self._last_error = mt5.last_error()
+                    logger.error("Failed to get account info")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        return False
+                
+                # Get symbol info
+                self.symbol_info = mt5.symbol_info(self._symbol)
+                if self.symbol_info is None:
+                    self._last_error = mt5.last_error()
+                    logger.error(f"Failed to get symbol info for {self._symbol}")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        return False
+                
+                # Enable symbol for trading
+                if not mt5.symbol_select(self._symbol, True):
+                    self._last_error = mt5.last_error()
+                    logger.error(f"Failed to select symbol {self._symbol}")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        return False
+                
+                self.connected = True
+                self._is_active = True
+                
+                # Mark all other connectors as inactive
+                for connector in _active_connectors:
+                    if connector != self:
+                        connector._is_active = False
+                        connector.connected = False
+                
+                logger.info(f"Successfully connected to MT5. Account: {self.account_info.login}")
+                logger.info(f"Balance: {self.account_info.balance}, Equity: {self.account_info.equity}")
+                
+                return True
+                
+            except Exception as e:
+                logger.error(f"Connection error (attempt {attempt + 1}): {e}")
+                try:
+                    self._last_error = mt5.last_error()
+                except Exception:
+                    pass
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    return False
+        
+        return False
     
     def disconnect(self):
         """Disconnect from MetaTrader 5"""
-        mt5.shutdown()
+        if self._is_active:
+            # Only shutdown if this instance is currently active
+            mt5.shutdown()
+            self._is_active = False
+            logger.info(f"Disconnected from MT5 account {self._login}")
         self.connected = False
-        logger.info("Disconnected from MT5")
+    
+    def __del__(self):
+        """Cleanup when connector is destroyed"""
+        try:
+            if self in _active_connectors:
+                _active_connectors.remove(self)
+        except Exception:
+            pass  # Ignore errors during cleanup
+    
+    def ensure_connection(self) -> bool:
+        """
+        Ensure this instance is connected to MT5.
+        If another instance is connected, switch to this one.
+        
+        Returns:
+            bool: True if connected, False otherwise
+        """
+        if self.connected and self._is_active:
+            # Double-check that we're still connected to the right account
+            current_account = mt5.account_info()
+            if current_account and current_account.login == self._login:
+                return True
+            else:
+                # Connection was hijacked by another instance
+                self._is_active = False
+                self.connected = False
+        
+        # Check if MT5 is connected to a different account
+        current_account = mt5.account_info()
+        if current_account and current_account.login != self._login:
+            logger.info(f"Switching from account {current_account.login} to {self._login}")
+        
+        return self.connect()
+    
+    def is_active_connection(self) -> bool:
+        """
+        Check if this instance is currently the active MT5 connection
+        
+        Returns:
+            bool: True if this instance is active, False otherwise
+        """
+        if not self.connected or not self._is_active:
+            return False
+        
+        current_account = mt5.account_info()
+        return current_account and current_account.login == self._login
+    
+    def get_connection_status(self) -> Dict:
+        """
+        Get detailed connection status information
+        
+        Returns:
+            Dict: Connection status details
+        """
+        current_account = mt5.account_info()
+        is_active = self.is_active_connection()
+        
+        return {
+            'login': self._login,
+            'connected': self.connected,
+            'is_active': is_active,
+            'current_mt5_account': current_account.login if current_account else None,
+            'account_matches': current_account and current_account.login == self._login
+        }
 
     def _sanitize_comment(self, text: str) -> str:
         """Sanitize order comment to ASCII and MT5 length limits (~27-31 chars)."""
@@ -111,13 +426,23 @@ class MT5Connector:
         Returns:
             Dict: Account information or None if failed
         """
-        if not self.connected:
+        if not self.ensure_connection():
             return None
         
         account_info = mt5.account_info()
         if account_info is None:
             return None
         
+        # Verify that we're connected to the correct account
+        if account_info.login != self._login:
+            logger.warning(f"Account mismatch: expected {self._login}, got {account_info.login}")
+            return None
+        
+        # Extract optional fields defensively (server/company may not exist in some APIs)
+        server = getattr(account_info, 'server', None)
+        company = getattr(account_info, 'company', None)
+        name = getattr(account_info, 'name', None)
+        trade_mode = getattr(account_info, 'trade_mode', None)
         return {
             'login': account_info.login,
             'balance': account_info.balance,
@@ -126,7 +451,11 @@ class MT5Connector:
             'free_margin': account_info.margin_free,
             'margin_level': account_info.margin_level,
             'currency': account_info.currency,
-            'leverage': account_info.leverage
+            'leverage': account_info.leverage,
+            'server': server,
+            'company': company,
+            'name': name,
+            'trade_mode': trade_mode,
         }
 
     def change_symbol(self, symbol: str) -> bool:
@@ -136,7 +465,13 @@ class MT5Connector:
                 return False
             self._symbol = symbol
             # ensure selected
-            return mt5.symbol_select(symbol, True)
+            ok = mt5.symbol_select(symbol, True)
+            try:
+                # refresh cached symbol_info for downstream consumers
+                self.symbol_info = mt5.symbol_info(symbol)
+            except Exception:
+                self.symbol_info = None
+            return ok
         except Exception:
             return False
     
@@ -171,6 +506,54 @@ class MT5Connector:
         """Return the current working symbol for this connector."""
         return self._symbol
     
+    def has_symbol(self, symbol: str) -> bool:
+        """Check if a symbol exists and is available to trade/select."""
+        try:
+            info = mt5.symbol_info(symbol)
+            if info:
+                # Try selecting to confirm availability
+                return mt5.symbol_select(symbol, True)
+            return False
+        except Exception:
+            return False
+
+    def detect_symbol_variant(self, base_symbols: list) -> list:
+        """Choose appropriate symbol variant based on availability (e.g., with '+' suffix).
+
+        Given base symbols like ['EURUSD','GBPUSD'], returns either ['EURUSD+','GBPUSD+']
+        if that variant exists, otherwise returns the base list.
+        """
+        try:
+            if not base_symbols:
+                return base_symbols
+            plus_candidate = f"{base_symbols[0]}+"
+            if self.has_symbol(plus_candidate):
+                return [f"{s}+" for s in base_symbols]
+            # Fallback to base if base exists
+            if self.has_symbol(base_symbols[0]):
+                return list(base_symbols)
+            # As a last resort, return base list (controller may handle errors)
+            return list(base_symbols)
+        except Exception:
+            return list(base_symbols)
+
+    def get_last_error_message(self) -> str:
+        """Return a formatted last MT5 error message for user display."""
+        try:
+            if not self._last_error:
+                return "Unknown error"
+            code, desc = self._last_error
+            hint = ""
+            # Common MT5 error hints
+            if code in (-10013,):
+                hint = " (check account number/password/server)"
+            elif code in (-10004, -10005):
+                hint = " (terminal not responding; try again)"
+            # Return user-friendly message without error code prefix
+            return f"{desc}{hint}"
+        except Exception:
+            return "Unknown error"
+    
     def get_rates(self, symbol: str = None, timeframe: str = None, count: int = 1000):
         """
         Get historical price data
@@ -183,7 +566,7 @@ class MT5Connector:
         Returns:
             DataFrame: OHLCV data or None if failed
         """
-        if not self.connected:
+        if not self.ensure_connection():
             logger.warning("MT5 not connected, cannot get rates")
             return None
         
@@ -238,7 +621,7 @@ class MT5Connector:
         Returns:
             Dict: Current prices or None if failed
         """
-        if not self.connected:
+        if not self.ensure_connection():
             return None
         
         try:
@@ -317,7 +700,7 @@ class MT5Connector:
         Returns:
             Dict: Order result or None if failed
         """
-        if not self.connected:
+        if not self.ensure_connection():
             return None
         
         try:
@@ -441,7 +824,7 @@ class MT5Connector:
         Returns:
             Dict: Order result or None if failed
         """
-        if not self.connected:
+        if not self.ensure_connection():
             return None
         
         try:
@@ -504,7 +887,7 @@ class MT5Connector:
         Returns:
             List[Dict]: List of open positions
         """
-        if not self.connected:
+        if not self.ensure_connection():
             return []
         
         try:
@@ -546,7 +929,7 @@ class MT5Connector:
         Returns:
             List[Dict]: List of pending orders
         """
-        if not self.connected:
+        if not self.ensure_connection():
             return []
         
         try:
@@ -587,7 +970,7 @@ class MT5Connector:
         Returns:
             bool: True if successful, False otherwise
         """
-        if not self.connected:
+        if not self.ensure_connection():
             return False
         
         try:
@@ -627,14 +1010,45 @@ class MT5Connector:
             
             # Send close request
             result = mt5.order_send(request)
-            if result is None or getattr(result, 'retcode', None) != mt5.TRADE_RETCODE_DONE:
+            success = not (result is None or getattr(result, 'retcode', None) != mt5.TRADE_RETCODE_DONE)
+            if not success:
                 ret = getattr(result, 'retcode', None) if result is not None else None
                 comment_text = getattr(result, 'comment', '') if result is not None else ''
                 logger.error(f"Failed to close position {ticket}: {ret} - {comment_text} last_error={mt5.last_error()}")
-                return False
-            
-            logger.info(f"Position {ticket} closed successfully - Reason: {reason}")
-            return True
+            else:
+                logger.info(f"Position {ticket} closed successfully - Reason: {reason}")
+
+            # Append to trade log regardless of success
+            try:
+                self._append_trade_log({
+                    'timestamp': datetime.now().isoformat(timespec='seconds'),
+                    'login': self._login or 'unknown',
+                    'ticket': ticket,
+                    'symbol': position.symbol,
+                    'type': position.type,
+                    'volume': position.volume,
+                    'profit': position.profit,
+                    'reason': f"{reason} ({'closed' if success else 'failed'})"
+                })
+                # If it was a losing close, save to a dedicated losses log for learning
+                try:
+                    if success and float(position.profit) < 0:
+                        self._append_loss_log({
+                            'timestamp': datetime.now().isoformat(timespec='seconds'),
+                            'login': self._login or 'unknown',
+                            'ticket': ticket,
+                            'symbol': position.symbol,
+                            'type': position.type,
+                            'volume': position.volume,
+                            'profit': position.profit,
+                            'reason': reason
+                        })
+                except Exception:
+                    logger.exception("Failed to append to loss_log.csv")
+            except Exception:
+                logger.exception("Failed to append to trade_log.csv")
+
+            return success
             
         except Exception as e:
             logger.error(f"Error closing position {ticket}: {e}")
@@ -651,7 +1065,7 @@ class MT5Connector:
         Returns:
             Dict: Summary of closed positions with success/failure counts
         """
-        if not self.connected:
+        if not self.ensure_connection():
             return {'success': 0, 'failed': 0, 'total': 0, 'details': []}
         
         try:
@@ -679,11 +1093,41 @@ class MT5Connector:
                         'status': 'closed' if success else 'failed'
                     }
                     aggregate['details'].append(detail)
+                    # Count aggregates
                     if success:
                         aggregate['success'] += 1
                         aggregate['total_profit'] += profit
                     else:
                         aggregate['failed'] += 1
+                    # Append to trade log CSV for both success and failure
+                    try:
+                        self._append_trade_log({
+                            'timestamp': datetime.now().isoformat(timespec='seconds'),
+                            'login': self._login or 'unknown',
+                            'ticket': ticket,
+                            'symbol': symbol_name,
+                            'type': pos_type,
+                            'volume': volume,
+                            'profit': profit,
+                            'reason': f"{reason} ({'closed' if success else 'failed'})"
+                        })
+                        # Save losing closes to dedicated losses log
+                        try:
+                            if success and float(profit) < 0:
+                                self._append_loss_log({
+                                    'timestamp': datetime.now().isoformat(timespec='seconds'),
+                                    'login': self._login or 'unknown',
+                                    'ticket': ticket,
+                                    'symbol': symbol_name,
+                                    'type': pos_type,
+                                    'volume': volume,
+                                    'profit': profit,
+                                    'reason': reason
+                                })
+                        except Exception:
+                            logger.exception("Failed to append to loss_log.csv")
+                    except Exception:
+                        logger.exception("Failed to append to trade_log.csv")
                 # small pause between attempts
                 import time as _t
                 _t.sleep(0.3)
@@ -693,14 +1137,62 @@ class MT5Connector:
             remaining = self.get_positions(symbol)
             if remaining:
                 aggregate['remaining'] = [p['ticket'] for p in remaining]
+            # Persist trade close log to logs folder
+            try:
+                self._write_close_log(aggregate, reason)
+            except Exception:
+                logger.exception("Failed to write close positions log")
             return aggregate
         except Exception as e:
             logger.error(f"Error closing all positions: {e}")
             return {'success': 0, 'failed': 0, 'total': 0, 'details': [], 'error': str(e)}
 
+    def close_partial_position(self, ticket: int, close_fraction: float, reason: str = "Partial take profit") -> bool:
+        """Close part of an open position volume."""
+        if not self.ensure_connection():
+            return False
+        try:
+            positions = mt5.positions_get(ticket=ticket)
+            if not positions:
+                return False
+            pos = positions[0]
+            if not (0 < close_fraction < 1.0):
+                return False
+            close_volume = max(round(pos.volume * close_fraction, 2), 0.01)
+            tick = mt5.symbol_info_tick(pos.symbol)
+            if tick is None:
+                return False
+            if pos.type == 0:
+                order_type = mt5.ORDER_TYPE_SELL
+                price = tick.bid
+            else:
+                order_type = mt5.ORDER_TYPE_BUY
+                price = tick.ask
+            req = {
+                'action': mt5.TRADE_ACTION_DEAL,
+                'symbol': pos.symbol,
+                'volume': close_volume,
+                'type': order_type,
+                'position': ticket,
+                'price': price,
+                'deviation': 40,
+                'magic': pos.magic,
+                'comment': self._sanitize_comment(f"Partial: {reason}"),
+                'type_time': mt5.ORDER_TIME_GTC,
+                'type_filling': mt5.ORDER_FILLING_IOC,
+            }
+            result = mt5.order_send(req)
+            if result is None or getattr(result, 'retcode', None) != mt5.TRADE_RETCODE_DONE:
+                logger.warning(f"Partial close failed {ticket}: {getattr(result, 'retcode', None)} {getattr(result, 'comment', '')}")
+                return False
+            return True
+        except Exception as e:
+            logger.error(f"Error partial closing position {ticket}: {e}")
+            return False
+
     def cancel_all_orders(self, symbol: str = None) -> Dict:
         """Cancel all pending orders (optionally filter by symbol)."""
-        if not self.connected:
+        if not self.ensure_connection():
             return {'success': 0, 'failed': 0, 'total': 0, 'details': []}
         try:
             orders = self.get_orders(symbol)
@@ -728,7 +1220,7 @@ class MT5Connector:
         Returns:
             bool: True if successful, False otherwise
         """
-        if not self.connected:
+        if not self.ensure_connection():
             return False
         
         try:
@@ -746,10 +1238,75 @@ class MT5Connector:
             
             logger.info(f"Order {ticket} cancelled successfully")
             return True
-            
+        
         except Exception as e:
             logger.error(f"Error cancelling order {ticket}: {e}")
             return False
+
+    # --- Logging helpers ---
+    def _write_close_log(self, aggregate: Dict, reason: str):
+        """Append to a single CSV trade log file when positions are closed."""
+        import os, csv
+        from datetime import datetime as _dt
+        os.makedirs('logs', exist_ok=True)
+        login = self._login or 'unknown'
+        filename = os.path.join('logs', 'close_log.csv')
+        headers = ['timestamp','login','reason','ticket','symbol','type','volume','profit','status']
+        
+        # Check if file exists to determine if we need to write headers
+        file_exists = os.path.exists(filename)
+        
+        now_iso = _dt.now().isoformat(timespec='seconds')
+        lines = []
+        for d in aggregate.get('details', []):
+            lines.append([
+                now_iso,
+                login,
+                reason,
+                d.get('ticket',''),
+                d.get('symbol',''),
+                d.get('type',''),
+                d.get('volume',''),
+                d.get('profit',''),
+                d.get('status',''),
+            ])
+        
+        # Append to the single close_log.csv file
+        with open(filename, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(headers)
+            writer.writerows(lines)
+        logger.info(f"Close positions log appended to: {filename}")
+
+    def _append_trade_log(self, row: Dict):
+        """Append a single closed-trade row to logs/trade_log.csv"""
+        import os, csv
+        os.makedirs('logs', exist_ok=True)
+        filename = os.path.join('logs', 'trade_log.csv')
+        file_exists = os.path.exists(filename)
+        headers = ['timestamp','login','ticket','symbol','type','volume','profit','reason']
+        with open(filename, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=headers)
+            if not file_exists:
+                writer.writeheader()
+            # sanitize minimal fields
+            safe = {k: row.get(k, '') for k in headers}
+            writer.writerow(safe)
+
+    def _append_loss_log(self, row: Dict):
+        """Append losing closed-trade rows to logs/loss_log.csv for focused learning"""
+        import os, csv
+        os.makedirs('logs', exist_ok=True)
+        filename = os.path.join('logs', 'loss_log.csv')
+        file_exists = os.path.exists(filename)
+        headers = ['timestamp','login','ticket','symbol','type','volume','profit','reason']
+        with open(filename, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=headers)
+            if not file_exists:
+                writer.writeheader()
+            safe = {k: row.get(k, '') for k in headers}
+            writer.writerow(safe)
     
     def get_trading_hours(self) -> bool:
         """
@@ -782,6 +1339,35 @@ class MT5Connector:
             logger.error(f"Error getting spread: {e}")
             return None
 
+    def modify_position_sl_tp(self, ticket: int, new_sl: Optional[float], new_tp: Optional[float]) -> bool:
+        """Modify an open position's SL/TP.
+        Uses TRADE_ACTION_SLTP to update stops without opening a new position.
+        """
+        if not self.ensure_connection():
+            return False
+        try:
+            positions = mt5.positions_get(ticket=ticket)
+            if not positions:
+                return False
+            pos = positions[0]
+            req = {
+                'action': mt5.TRADE_ACTION_SLTP,
+                'position': ticket,
+                'symbol': pos.symbol,
+                'sl': new_sl,
+                'tp': new_tp,
+                'magic': pos.magic,
+                'comment': self._sanitize_comment('Modify SL/TP'),
+            }
+            result = mt5.order_send(req)
+            if result is None or getattr(result, 'retcode', None) != mt5.TRADE_RETCODE_DONE:
+                logger.warning(f"SL/TP modify failed for {ticket}: {getattr(result, 'retcode', None)} {getattr(result, 'comment', '')}")
+                return False
+            return True
+        except Exception as e:
+            logger.error(f"Error modifying SL/TP for {ticket}: {e}")
+            return False
+
     def get_history_deals(self, start: datetime, end: datetime) -> List[Dict]:
         """
         Get account deal history between start and end.
@@ -793,7 +1379,7 @@ class MT5Connector:
         Returns:
             List[Dict]: List of deals with basic fields
         """
-        if not self.connected:
+        if not self.ensure_connection():
             return []
         try:
             deals = mt5.history_deals_get(start, end)
@@ -840,3 +1426,104 @@ class MT5Connector:
         else:
             start = now - timedelta(days=30)
         return self.get_history_deals(start, now)
+    
+    def test_connection(self) -> Dict:
+        """
+        Test MT5 connection and return detailed status information
+        
+        Returns:
+            Dict: Connection test results
+        """
+        test_results = {
+            'connection_successful': False,
+            'mt5_initialized': False,
+            'account_connected': False,
+            'symbol_available': False,
+            'data_retrieval': False,
+            'errors': [],
+            'warnings': [],
+            'account_info': None,
+            'symbol_info': None
+        }
+        
+        try:
+            # Test 1: Check if MT5 can be initialized
+            logger.info("Testing MT5 initialization...")
+            if mt5.initialize(path=self._terminal_path):
+                test_results['mt5_initialized'] = True
+                logger.info("✓ MT5 initialized successfully")
+            else:
+                error_code, error_desc = mt5.last_error()
+                test_results['errors'].append(f"MT5 initialization failed: {error_code} - {error_desc}")
+                logger.error(f"✗ MT5 initialization failed: {error_code} - {error_desc}")
+                return test_results
+            
+            # Test 2: Check account connection
+            logger.info("Testing account connection...")
+            account_info = mt5.account_info()
+            if account_info:
+                test_results['account_connected'] = True
+                test_results['account_info'] = {
+                    'login': account_info.login,
+                    'server': account_info.server,
+                    'balance': account_info.balance,
+                    'equity': account_info.equity,
+                    'currency': account_info.currency
+                }
+                logger.info(f"✓ Connected to account {account_info.login} on {account_info.server}")
+            else:
+                test_results['errors'].append("No account information available")
+                logger.error("✗ No account information available")
+            
+            # Test 3: Check symbol availability
+            logger.info(f"Testing symbol availability: {self._symbol}")
+            symbol_info = mt5.symbol_info(self._symbol)
+            if symbol_info:
+                test_results['symbol_available'] = True
+                test_results['symbol_info'] = {
+                    'name': symbol_info.name,
+                    'point': symbol_info.point,
+                    'digits': symbol_info.digits,
+                    'spread': symbol_info.spread,
+                    'trade_mode': symbol_info.trade_mode
+                }
+                logger.info(f"✓ Symbol {self._symbol} is available")
+            else:
+                test_results['errors'].append(f"Symbol {self._symbol} not available")
+                logger.error(f"✗ Symbol {self._symbol} not available")
+            
+            # Test 4: Test data retrieval
+            logger.info("Testing data retrieval...")
+            rates = mt5.copy_rates_from_pos(self._symbol, TIMEFRAME_MAPPING.get(self._timeframe, 15), 0, 10)
+            if rates is not None and len(rates) > 0:
+                test_results['data_retrieval'] = True
+                logger.info(f"✓ Successfully retrieved {len(rates)} bars of data")
+            else:
+                test_results['errors'].append("Failed to retrieve market data")
+                logger.error("✗ Failed to retrieve market data")
+            
+            # Overall connection status
+            test_results['connection_successful'] = (
+                test_results['mt5_initialized'] and 
+                test_results['account_connected'] and 
+                test_results['symbol_available'] and 
+                test_results['data_retrieval']
+            )
+            
+            if test_results['connection_successful']:
+                logger.info("✓ All connection tests passed!")
+            else:
+                logger.error("✗ Some connection tests failed")
+            
+        except Exception as e:
+            test_results['errors'].append(f"Connection test error: {str(e)}")
+            logger.error(f"✗ Connection test error: {e}")
+        
+        finally:
+            # Clean up
+            try:
+                mt5.shutdown()
+            except Exception:
+                pass
+        
+        return test_results

@@ -66,6 +66,12 @@ class AIStrategy:
             if any(loading_results.values()):
                 self.is_trained = True
                 logger.info(f"Loaded {sum(loading_results.values())} AI models")
+                try:
+                    # Only create ensemble if it wasn't already loaded from disk
+                    if self.model_manager.ensemble_model is None:
+                        self.model_manager._create_ensemble_model()
+                except Exception:
+                    logger.warning("Could not create ensemble from loaded models; will fallback to best model at predict time")
             else:
                 logger.info("No existing models found - will train new models")
                 
@@ -91,8 +97,19 @@ class AIStrategy:
             if features.empty:
                 return {'signal': 'no_signal', 'reason': 'Failed to create features'}
             
-            # Get latest features
-            latest_features = features.iloc[-1:].values
+            # Align feature columns to training schema and transform consistently
+            try:
+                expected_cols = self.data_processor.feature_names or list(features.select_dtypes(include=[np.number]).columns)
+                # Reindex to expected columns (fill missing with 0), drop extras
+                features_aligned = features.reindex(columns=expected_cols, fill_value=0)
+                X_all = self.data_processor.transform_features(features_aligned)
+                if X_all.size == 0:
+                    # Fallback to raw values if scaler not fitted
+                    latest_features = features_aligned.iloc[-1:].values
+                else:
+                    latest_features = X_all[-1:].reshape(1, -1)
+            except Exception:
+                latest_features = features.iloc[-1:].values
             
             if not self.is_trained:
                 return {'signal': 'no_signal', 'reason': 'AI models not trained'}
@@ -116,6 +133,13 @@ class AIStrategy:
             
             self.prediction_history.append(self.last_prediction)
             self.prediction_confidence = confidence
+
+            # Generate simple explainability for this prediction
+            try:
+                feature_names = self.data_processor.feature_names or [f"f{i}" for i in range(latest_features.shape[1])]
+                self.last_prediction['explain'] = self.model_manager.explain(latest_features, feature_names)
+            except Exception:
+                self.last_prediction['explain'] = None
             
             # Update accuracy metrics
             self.accuracy_metrics['total_predictions'] += 1

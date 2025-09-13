@@ -555,7 +555,7 @@ class DataProcessor:
             }
             
             joblib.dump(processor_data, filepath)
-            logger.info(f"Saved processor to {filepath}")
+            logger.info("Saved processor successfully")
             
         except Exception as e:
             logger.error(f"Error saving processor: {e}")
@@ -590,7 +590,7 @@ class DataProcessor:
                 self.feature_scaler = _MinMaxScaler()
                 self.is_fitted = False
             
-            logger.info(f"Loaded processor from {filepath}")
+            logger.info("Loaded processor successfully")
             return True
             
         except Exception as e:

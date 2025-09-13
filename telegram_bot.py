@@ -25,6 +25,7 @@ from config import (
     NEWS_CATEGORY,
 )
 from mt5_connector import MT5Connector
+from database import db_manager
 try:
     from ai.auto_trainer import AutoTrainer
 except Exception:
@@ -51,7 +52,7 @@ from telegram.ext import (
 logger = logging.getLogger(__name__)
 
 
-def _build_main_reply_keyboard(news_count: int = 0) -> ReplyKeyboardMarkup:
+def _build_main_reply_keyboard(news_count: int = 0, is_admin: bool = False) -> ReplyKeyboardMarkup:
     news_label = "📰 News" if news_count <= 0 else f"📰 News ({news_count})"
     keyboard_layout = [
         ["ℹ️ Info", "👤 Account"],
@@ -63,6 +64,15 @@ def _build_main_reply_keyboard(news_count: int = 0) -> ReplyKeyboardMarkup:
         ["🚀 AI Train", "📈 AI Performance"],
         [news_label],
     ]
+    
+    # Add admin-only buttons if user is admin
+    if is_admin:
+        keyboard_layout.extend([
+            ["👑 Admin Panel"],
+            ["➕ Add User", "📋 List Users"],
+            ["📊 DB Stats"]
+        ])
+    
     return ReplyKeyboardMarkup(
         keyboard_layout,
         resize_keyboard=True,
@@ -70,11 +80,20 @@ def _build_main_reply_keyboard(news_count: int = 0) -> ReplyKeyboardMarkup:
         is_persistent=True,
     )
 
-def _build_minimal_reply_keyboard() -> ReplyKeyboardMarkup:
+def _build_minimal_reply_keyboard(is_admin: bool = False) -> ReplyKeyboardMarkup:
     keyboard_layout = [
         ["ℹ️ Info"],
         ["🔑 Login", "👤 Account"],
     ]
+    
+    # Add admin-only buttons if user is admin
+    if is_admin:
+        keyboard_layout.extend([
+            ["👑 Admin Panel"],
+            ["➕ Add User", "📋 List Users"],
+            ["📊 DB Stats"]
+        ])
+    
     return ReplyKeyboardMarkup(
         keyboard_layout,
         resize_keyboard=True,
@@ -117,10 +136,46 @@ class TelegramBot:
     def _get_session(self, chat_id: int) -> Optional[MT5Connector]:
         """Return per-chat MT5Connector if exists, else None (force login)."""
         return self._sessions.get(chat_id)
+    
+    def _is_user_authorized(self, chat_id: int) -> bool:
+        """Check if telegram chat ID is authorized to use the bot."""
+        return db_manager.is_telegram_user_authorized(chat_id)
+    
+    def _is_user_admin(self, chat_id: int) -> bool:
+        """Check if telegram chat ID is an admin."""
+        return db_manager.is_user_admin(chat_id)
+    
+    async def _check_user_authorization(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        """Check user authorization and send error message if not authorized."""
+        chat_id = update.effective_chat.id
+        
+        if not self._is_user_authorized(chat_id):
+            await update.message.reply_text(
+                "❌ Access Denied\n\n"
+                "You are not authorized to use this bot. Please contact the administrator to get access."
+            )
+            return False
+        return True
+    
+    async def _check_admin_authorization(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        """Check admin authorization and send error message if not admin."""
+        chat_id = update.effective_chat.id
+        
+        if not self._is_user_admin(chat_id):
+            await update.message.reply_text(
+                "❌ Admin Access Required\n\n"
+                "This command is only available to administrators."
+            )
+            return False
+        return True
 
     async def _cmd_login(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """/login <login> <password> <server>  OR interactive when no args."""
         try:
+            # Check user authorization first
+            if not await self._check_user_authorization(update, context):
+                return
+                
             args = context.args
             if len(args) < 3:
                 # Start interactive wizard
@@ -131,22 +186,49 @@ class TelegramBot:
             login = int(args[0])
             password = args[1]
             server = args[2]
+            
+            # Check if user is already logged in with a different account
+            existing_session = self._sessions.get(update.effective_chat.id)
+            if existing_session and existing_session._login != login:
+                await update.message.reply_text(
+                    f"You are already logged in with account {existing_session._login}. "
+                    f"Please logout first before switching to account {login}."
+                )
+                return
+            
             # Create and connect new session
             session = MT5Connector(login=login, password=password, server=server,
                                    terminal_path=None)
             if not session.connect():
-                await update.message.reply_text("MT5 login failed. Check credentials/server.")
+                # Provide specific MT5 error if available
+                try:
+                    msg = session.get_last_error_message()
+                except Exception:
+                    msg = "MT5 login failed. Check credentials/server."
+                await update.message.reply_text(f"❌ {msg}")
                 return
+            
+            # Store session and update database
             self._sessions[update.effective_chat.id] = session
+            
+            # Get bot user info and store MT account in database
+            chat_id = update.effective_chat.id
+            bot_user = db_manager.get_bot_user_by_telegram_chat_id(chat_id)
+            if bot_user:
+                db_manager.add_mt_account(bot_user['bot_user_id'], login)
+                logger.info(f"Stored MT account {login} for bot_user_id {bot_user['bot_user_id']}")
+            
             info = session.get_account_info() or {}
             await update.message.reply_text(
-                f"Logged in: {info.get('login', login)}"
+                f"✅ Logged in to account: {info.get('login', login)}\n"
+                f"Balance: {info.get('balance', 0):.2f} {info.get('currency', '')}"
             )
             # Show full keyboard after login
             try:
                 count = await self._get_upcoming_count()
+                is_admin = self._is_user_admin(chat_id)
                 await update.message.reply_text(
-                    "Keyboard updated.", reply_markup=_build_main_reply_keyboard(count)
+                    "Keyboard updated.", reply_markup=_build_main_reply_keyboard(count, is_admin)
                 )
             except Exception:
                 pass
@@ -159,14 +241,32 @@ class TelegramBot:
         if not session:
             await update.message.reply_text("No session to logout.")
             return
+        
+        account_login = session._login
         try:
-            session.disconnect()
+            # Only disconnect if this session is currently active
+            if session.is_active_connection():
+                session.disconnect()
+            else:
+                # Just remove from sessions if not active
+                logger.info(f"Removing inactive session for account {account_login}")
         except Exception:
             pass
+        
+        # Remove from database
+        bot_user = db_manager.get_bot_user_by_telegram_chat_id(chat_id)
+        if bot_user:
+            db_manager.remove_mt_account(bot_user['bot_user_id'])
+            logger.info(f"Removed MT account from database for bot_user_id {bot_user['bot_user_id']}")
+        
         self._sessions.pop(chat_id, None)
-        await update.message.reply_text("Logged out of MT5 for this chat.")
+        await update.message.reply_text(f"✅ Logged out of MT5 account {account_login} for this chat.")
 
     async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # Check user authorization first
+        if not await self._check_user_authorization(update, context):
+            return
+            
         await update.message.reply_text(
             "Welcome to Price Action Bot. Use the buttons or commands.",
             reply_markup=_build_show_hide_inline(),
@@ -174,6 +274,10 @@ class TelegramBot:
 
     async def _cmd_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Stop trading and close all positions with summary"""
+        # Check user authorization first
+        if not await self._check_user_authorization(update, context):
+            return
+            
         chat_id = update.effective_chat.id
         session = self._get_session(chat_id)
         
@@ -185,12 +289,16 @@ class TelegramBot:
         await update.message.reply_text("🛑 Stopping trade and closing all positions...")
         
         try:
-            # Point controller to this session's connector, then disable trading
+            # Disable only this chat's trading and close positions
             try:
-                self.controller.set_mt5_connector(session)
+                if hasattr(self.controller, 'stop_trading_for_chat'):
+                    self.controller.stop_trading_for_chat(chat_id)
+                else:
+                    # Fallback: legacy behavior affects global trading
+                    self.controller.set_mt5_connector(session)
+                    self.controller.disable_trading()
             except Exception:
                 pass
-            self.controller.disable_trading()
 
             # First cancel all pending orders
             try:
@@ -202,8 +310,14 @@ class TelegramBot:
             except Exception:
                 pass
 
-            # Close all positions
-            close_results = session.close_all_positions()
+            # Close all positions for this chat/account
+            try:
+                if hasattr(self.controller, 'close_all_positions_for_chat'):
+                    close_results = self.controller.close_all_positions_for_chat(chat_id)
+                else:
+                    close_results = session.close_all_positions()
+            except Exception:
+                close_results = self.controller.close_all_positions_for_chat(chat_id)
             
             # Build summary message
             summary_lines = ["📊 **Trade Stop Summary**\n"]
@@ -268,8 +382,8 @@ class TelegramBot:
         await update.message.reply_text("🔄 Closing all positions...")
         
         try:
-            # Close all positions
-            close_results = session.close_all_positions()
+            # Close all positions and update statistics
+            close_results = self.controller.close_all_positions_for_chat(chat_id)
             
             # Build summary message
             summary_lines = ["📊 **Close All Positions Summary**\n"]
@@ -328,6 +442,21 @@ class TelegramBot:
                 pass
             snap = self.controller.generate_analysis_snapshot()
             if snap:
+                # Attach AI explainability if available
+                try:
+                    ai = getattr(self.controller, 'ai_strategy', None)
+                    if ai and ai.last_prediction and ai.last_prediction.get('explain'):
+                        ex = ai.last_prediction['explain']
+                        top_pos = ex.get('top_positive') or []
+                        top_neg = ex.get('top_negative') or []
+                        lines = ["\nTop AI drivers:"]
+                        if top_pos:
+                            lines.append("+ " + ", ".join([f"{k} ({v:.3f})" for k, v in top_pos[:3]]))
+                        if top_neg:
+                            lines.append("- " + ", ".join([f"{k} ({v:.3f})" for k, v in top_neg[:3]]))
+                        snap = f"{snap}\n" + "\n".join(lines)
+                except Exception:
+                    pass
                 await update.message.reply_text(snap)
             else:
                 await update.message.reply_text("No snapshot available (no data or error).")
@@ -336,24 +465,37 @@ class TelegramBot:
             await update.message.reply_text(f"❌ Failed to analyze now: {e}")
     async def _cmd_start_trade(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Enable auto trading, using this chat's MT5 session if available."""
+        # Check user authorization first
+        if not await self._check_user_authorization(update, context):
+            return
+            
         chat_id = update.effective_chat.id
         session = self._get_session(chat_id)
         if not session:
             await update.message.reply_text("Please /login first with 🔑 Login or /login.")
             return
         try:
-            # Ensure controller uses this user's connector
-            self.controller.set_mt5_connector(session)
-            # Enable trading
-            self.controller.enable_trading()
+            # Enable trading only for this chat
+            try:
+                if hasattr(self.controller, 'start_trading_for_chat'):
+                    self.controller.start_trading_for_chat(chat_id, session)
+                else:
+                    # Legacy fallback: global
+                    self.controller.set_mt5_connector(session)
+                    self.controller.enable_trading()
+            except Exception as e:
+                logger.exception("Error enabling trading for chat")
+                await update.message.reply_text(f"❌ Failed to enable trading: {e}")
+                return
             # Subscribe this chat to telemetry
             try:
                 self.controller.subscribe_telemetry(chat_id)
             except Exception:
                 pass
+            is_admin = self._is_user_admin(chat_id)
             await update.message.reply_text(
                 "✅ Auto trading enabled. Use 🧠 Analyze Now anytime to see the latest analysis.",
-                reply_markup=_build_main_reply_keyboard(),
+                reply_markup=_build_main_reply_keyboard(is_admin=is_admin),
             )
 
             # Start AutoTrainer for continuous retraining if available
@@ -380,11 +522,12 @@ class TelegramBot:
         if query.data == "show_keyboard":
             # If user not logged in, show minimal keyboard
             chat_id = query.message.chat_id
+            is_admin = self._is_user_admin(chat_id)
             if chat_id in getattr(self, '_sessions', {}):
                 count = await self._get_upcoming_count()
-                kb = _build_main_reply_keyboard(count)
+                kb = _build_main_reply_keyboard(count, is_admin)
             else:
-                kb = _build_minimal_reply_keyboard()
+                kb = _build_minimal_reply_keyboard(is_admin)
             await query.message.reply_text("Keyboard shown.", reply_markup=kb)
         elif query.data == "hide_keyboard":
             await query.message.reply_text(
@@ -393,11 +536,12 @@ class TelegramBot:
 
     async def _cmd_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
+        is_admin = self._is_user_admin(chat_id)
         if chat_id in getattr(self, '_sessions', {}):
             count = await self._get_upcoming_count()
-            kb = _build_main_reply_keyboard(count)
+            kb = _build_main_reply_keyboard(count, is_admin)
         else:
-            kb = _build_minimal_reply_keyboard()
+            kb = _build_minimal_reply_keyboard(is_admin)
         await update.message.reply_text("Keyboard shown.", reply_markup=kb)
 
     async def _cmd_close(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -464,10 +608,46 @@ class TelegramBot:
         if not info:
             await update.message.reply_text("Unable to fetch account info.")
             return
+        # Detect account type heuristically using server/company/name
+        broker_meta = (info.get('server') or '') + ' ' + (info.get('company') or '') + ' ' + (info.get('name') or '')
+        broker_meta_l = broker_meta.lower()
+        if 'ecn' in broker_meta_l or 'raw' in broker_meta_l or 'zero' in broker_meta_l or 'prime' in broker_meta_l:
+            account_type = 'ECN'
+        elif 'pro' in broker_meta_l or 'vip' in broker_meta_l:
+            account_type = 'Pro'
+        elif 'swap' in broker_meta_l or 'islam' in broker_meta_l or 'islamic' in broker_meta_l:
+            account_type = 'Swap-free'
+        elif 'standard' in broker_meta_l or 'classic' in broker_meta_l:
+            account_type = 'Standard'
+        else:
+            account_type = 'Unknown'
+        # Detect symbol variant for this account
+        try:
+            from config import SYMBOLS as CFG_SYMBOLS
+            base_symbols = CFG_SYMBOLS if isinstance(CFG_SYMBOLS, list) else [CFG_SYMBOLS]
+        except Exception:
+            base_symbols = ['EURUSD','GBPUSD','USDJPY','AUDUSD','XAUUSD']
+        detected_symbols = []
+        try:
+            detected_symbols = session.detect_symbol_variant(base_symbols)
+        except Exception:
+            detected_symbols = base_symbols
+        symbol_variant = ','.join(detected_symbols)
+        # If unknown from metadata but '+' symbols detected, hint ECN/Raw
+        if account_type == 'Unknown' and any(s.endswith('+') for s in detected_symbols):
+            account_type = 'ECN'
+
+        # Check if this session is currently active
+        is_active = session.is_active_connection()
+        status = "🟢 Active" if is_active else "🟡 Inactive (another user connected)"
+        
         msg = (
             "Account Information\n"
             "----------------------------\n"
             f"Account: {info['login']}\n"
+            f"Type: {account_type}\n"
+            f"Server: {info.get('server','-')}\n"
+            f"Status: {status}\n"
             f"Leverage: {info['leverage']}\n"
             f"Currency: {info['currency']}\n"
             "\nBalance Information\n"
@@ -477,7 +657,13 @@ class TelegramBot:
             f"Margin: {info['margin']:.2f}\n"
             f"Free Margin: {info['free_margin']:.2f}"
         )
-        await update.message.reply_text(msg)
+        # Append symbol mapping info
+        msg2 = (
+            "\n\nSymbol Mapping\n"
+            "----------------------------\n"
+            f"Detected: {symbol_variant}"
+        )
+        await update.message.reply_text(msg + msg2)
 
     async def _cmd_info(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         session = self._get_session(update.effective_chat.id)
@@ -658,21 +844,46 @@ class TelegramBot:
             await update.message.reply_text("Usage: /set_tp_sl <tp_points> <sl_points>")
 
     async def _cmd_performance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        stats = self.controller.stats if hasattr(self.controller, 'stats') else None
+        chat_id = update.effective_chat.id
+        
+        # Get user-specific session stats
+        user_session = self.controller._user_sessions.get(chat_id)
+        if not user_session:
+            await update.message.reply_text("❌ No active trading session. Please /login first.")
+            return
+            
+        stats = user_session.get('stats', {})
         if not stats:
             await update.message.reply_text("No stats available.")
             return
-        total = stats.get('total_trades', 0)
-        win = stats.get('winning_trades', 0)
-        loss = stats.get('losing_trades', 0)
-        profit = stats.get('total_profit', 0.0)
-        win_rate = (win / max(total, 1)) * 100
+            
+        total = int(stats.get('total_trades', 0) or 0)
+        win = int(stats.get('winning_trades', 0) or 0)
+        loss = int(stats.get('losing_trades', 0) or 0)
+        profit = float(stats.get('total_profit', 0.0) or 0.0)
+        
+        # Prefer computed total from outcomes if it's larger/more accurate
+        outcomes_total = win + loss
+        denom = outcomes_total if outcomes_total > 0 else max(total, 1)
+        # Clamp win to denominator to avoid >100%
+        win_clamped = min(max(win, 0), denom)
+        win_rate = (win_clamped / denom) * 100.0
+        
+        # Get session info
+        session_start = stats.get('session_start', 'Unknown')
+        if isinstance(session_start, str):
+            session_display = session_start
+        else:
+            session_display = session_start.strftime('%Y-%m-%d %H:%M') if session_start else 'Unknown'
+            
         msg = (
-            f"Trades: {total} (W:{win} L:{loss})\n"
-            f"Win rate: {win_rate:.1f}%\n"
-            f"Total P/L: {profit:.2f}"
+            f"📊 **Performance Report**\n\n"
+            f"**Trades:** {total} (W:{win} L:{loss})\n"
+            f"**Win Rate:** {win_rate:.1f}%\n"
+            f"**Total P/L:** {profit:.2f}\n"
+            f"**Session Started:** {session_display}"
         )
-        await update.message.reply_text(msg)
+        await update.message.reply_text(msg, parse_mode='Markdown')
 
     async def _cmd_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Usage: /history [day|week|month], default day
@@ -920,14 +1131,85 @@ class TelegramBot:
 
             # Update keyboard with badge
             try:
+                is_admin = self._is_user_admin(update.effective_chat.id)
                 await update.message.reply_text(
-                    "Menu updated.", reply_markup=_build_main_reply_keyboard(len(upcoming))
+                    "Menu updated.", reply_markup=_build_main_reply_keyboard(len(upcoming), is_admin)
                 )
             except Exception:
                 pass
         except Exception:
             logger.exception("Error fetching news/calendar")
             await update.message.reply_text("Error fetching news/calendar.")
+
+    async def _cmd_sessions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show all active MT5 sessions"""
+        try:
+            if not self._sessions:
+                await update.message.reply_text("No active MT5 sessions.")
+                return
+            
+            # Get current active account
+            current_account = None
+            try:
+                import MetaTrader5 as mt5
+                account_info = mt5.account_info()
+                if account_info:
+                    current_account = account_info.login
+            except Exception:
+                pass
+            
+            message_lines = ["🔗 **Active MT5 Sessions**\n"]
+            
+            for chat_id, session in self._sessions.items():
+                is_active = session.is_active_connection()
+                status = "🟢 Active" if is_active else "🟡 Inactive"
+                
+                # Get account info
+                try:
+                    info = session.get_account_info()
+                    if info:
+                        account_display = f"{info['login']} ({info['balance']:.2f} {info['currency']})"
+                    else:
+                        account_display = f"{session._login} (info unavailable)"
+                except Exception:
+                    account_display = f"{session._login} (error)"
+                
+                message_lines.append(f"Chat {chat_id}: {account_display} - {status}")
+            
+            if current_account:
+                message_lines.append(f"\n🌐 Currently connected to: {current_account}")
+            
+            message = "\n".join(message_lines)
+            await update.message.reply_text(message, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"Error in sessions command: {e}")
+            await update.message.reply_text(f"❌ Error getting sessions: {e}")
+
+    async def _cmd_switch(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Switch to your MT5 account (force connection)"""
+        try:
+            session = self._get_session(update.effective_chat.id)
+            if not session:
+                await update.message.reply_text("Please /login first.")
+                return
+            
+            # Force connection to this user's account
+            if session.ensure_connection():
+                info = session.get_account_info()
+                if info:
+                    await update.message.reply_text(
+                        f"✅ Switched to account: {info['login']}\n"
+                        f"Balance: {info['balance']:.2f} {info['currency']}"
+                    )
+                else:
+                    await update.message.reply_text(f"✅ Switched to account: {session._login}")
+            else:
+                await update.message.reply_text("❌ Failed to switch to your account. Please try /login again.")
+                
+        except Exception as e:
+            logger.error(f"Error in switch command: {e}")
+            await update.message.reply_text(f"❌ Error switching account: {e}")
 
     async def _cmd_ai_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show AI strategy status"""
@@ -1132,7 +1414,7 @@ class TelegramBot:
                     safe_tag = sym_tag.replace('/', '').replace(' ', '')
                     csv_path = os.path.join('ai/data', f'train_{safe_tag}_{timestamp}.csv')
                     combined_data.to_csv(csv_path, index=False)
-                    await update.message.reply_text(f"💾 Training dataset saved: {csv_path}")
+                    await update.message.reply_text("💾 Training dataset saved successfully")
                 except Exception as ex:
                     logger.warning(f"Failed to export training dataset: {ex}")
 
@@ -1220,12 +1502,39 @@ class TelegramBot:
                     f"• Prediction: {last_prediction.get('prediction', 'N/A')}",
                     f"• Confidence: {last_prediction.get('confidence', 0.0):.3f}",
                 ])
+                # Add drivers
+                try:
+                    ex = last_prediction.get('explain') or {}
+                    top_pos = ex.get('top_positive') or []
+                    top_neg = ex.get('top_negative') or []
+                    if top_pos or top_neg:
+                        message_lines.append("• Top Drivers:")
+                        if top_pos:
+                            message_lines.append("  + " + ", ".join([f"{k} ({v:.3f})" for k, v in top_pos[:3]]))
+                        if top_neg:
+                            message_lines.append("  - " + ", ".join([f"{k} ({v:.3f})" for k, v in top_neg[:3]]))
+                except Exception:
+                    pass
             else:
-                message_lines.extend([
-                    "",
-                    "**Last Prediction:**",
-                    "• No predictions made yet",
-                ])
+                message_lines.extend(["", "**Last Prediction:**", "• No predictions made yet"]) 
+
+            # Global feature importance summary
+            try:
+                feature_names = ai_strategy.data_processor.feature_names or []
+                if feature_names:
+                    global_imps = ai_strategy.model_manager.get_global_feature_importance(feature_names)
+                    avg = {}
+                    for _, m in global_imps.items():
+                        for f, v in m.items():
+                            avg[f] = avg.get(f, 0.0) + v
+                    if avg:
+                        total_models = max(1, len(global_imps))
+                        for f in list(avg.keys()):
+                            avg[f] /= total_models
+                        top = sorted(avg.items(), key=lambda x: x[1], reverse=True)[:5]
+                        message_lines.extend(["", "**Global Feature Importance (avg):**", "• " + ", ".join([f"{k} ({v:.3f})" for k, v in top])])
+            except Exception:
+                pass
             
             message = "\n".join(message_lines)
             await update.message.reply_text(message, parse_mode='Markdown')
@@ -1290,16 +1599,216 @@ class TelegramBot:
             logger.error(f"Error in close reasons command: {e}")
             await update.message.reply_text("❌ Error retrieving close reasons data")
 
+    async def _cmd_db_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show database statistics (admin command)"""
+        try:
+            # Check admin authorization first
+            if not await self._check_admin_authorization(update, context):
+                return
+            stats = db_manager.get_database_stats()
+            
+            message_lines = [
+                "📊 Database Statistics",
+                "",
+                f"Total Bot Users: {stats['total_bot_users']}",
+                f"Total MT Accounts: {stats['total_mt_accounts']}",
+                f"Active Sessions: {stats['active_sessions']}",
+                f"Database Path: {stats['database_path']}",
+            ]
+            
+            if 'error' in stats:
+                message_lines.append(f"Error: {stats['error']}")
+            
+            message = "\n".join(message_lines)
+            await update.message.reply_text(message)
+            
+        except Exception as e:
+            logger.error(f"Error in database stats command: {e}")
+            await update.message.reply_text(f"❌ Error getting database stats: {e}")
+
+    async def _cmd_add_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Add a new bot user (admin command)"""
+        try:
+            # Check admin authorization first
+            if not await self._check_admin_authorization(update, context):
+                return
+            if not context.args:
+                await update.message.reply_text("Usage: /add_user <telegram_chat_id> [admin]")
+                return
+            
+            try:
+                telegram_chat_id = int(context.args[0])
+            except ValueError:
+                await update.message.reply_text("❌ Invalid telegram_chat_id. Must be a number.")
+                return
+            
+            # Check if admin flag is provided
+            is_admin = len(context.args) > 1 and context.args[1].lower() in ['admin', 'true', '1', 'yes']
+            
+            # Add user to database
+            bot_user_id = db_manager.add_bot_user(telegram_chat_id, is_admin)
+            
+            if bot_user_id:
+                admin_status = "Admin" if is_admin else "Regular User"
+                await update.message.reply_text(
+                    f"✅ Added bot user successfully!\n"
+                    f"Bot User ID: {bot_user_id}\n"
+                    f"Telegram Chat ID: {telegram_chat_id}\n"
+                    f"Role: {admin_status}"
+                )
+            else:
+                await update.message.reply_text("❌ Failed to add bot user. User might already exist.")
+                
+        except Exception as e:
+            logger.error(f"Error in add user command: {e}")
+            await update.message.reply_text(f"❌ Error adding user: {e}")
+
+    async def _cmd_list_users(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """List all bot users (admin command)"""
+        try:
+            # Check admin authorization first
+            if not await self._check_admin_authorization(update, context):
+                return
+            users = db_manager.get_all_bot_users()
+            
+            if not users:
+                await update.message.reply_text("📋 Bot Users\n\nNo users found.")
+                return
+            
+            message_lines = ["📋 Bot Users", ""]
+            
+            for user in users:
+                # Check if user has an MT account
+                mt_account = db_manager.get_mt_account_by_bot_user_id(user['bot_user_id'])
+                account_status = f"MT Account: {mt_account['mt_account_number']}" if mt_account else "No MT Account"
+                role_status = "👑 Admin" if user['is_admin'] else "👤 User"
+                
+                message_lines.append(
+                    f"User {user['bot_user_id']}:\n"
+                    f"• Telegram Chat ID: {user['telegram_chat_id']}\n"
+                    f"• Role: {role_status}\n"
+                    f"• {account_status}\n"
+                    f"• Created: {user['created_at']}\n"
+                )
+            
+            message = "\n".join(message_lines)
+            
+            # Split message if too long
+            if len(message) > 4000:
+                # Send first part
+                first_part = "\n".join(message_lines[:10])  # First 10 lines
+                await update.message.reply_text(first_part)
+                
+                # Send remaining parts
+                remaining_lines = message_lines[10:]
+                for i in range(0, len(remaining_lines), 10):
+                    chunk = "\n".join(remaining_lines[i:i+10])
+                    await update.message.reply_text(chunk)
+            else:
+                await update.message.reply_text(message)
+                
+        except Exception as e:
+            logger.error(f"Error in list users command: {e}")
+            await update.message.reply_text(f"❌ Error listing users: {e}")
+
+    async def _cmd_admin_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show admin panel with available admin commands"""
+        try:
+            # Check admin authorization first
+            if not await self._check_admin_authorization(update, context):
+                return
+            
+            message_lines = [
+                "👑 Admin Panel",
+                "",
+                "Available Admin Commands:",
+                "• /add_user <telegram_chat_id> [admin] - Add new user",
+                "• /list_users - List all users",
+                "• /db_stats - View database statistics",
+                "",
+                "Admin Buttons:",
+                "• ➕ Add User - Add new user (interactive)",
+                "• 📋 List Users - Show all users",
+                "• 📊 DB Stats - Database statistics",
+                "",
+                "Usage Examples:",
+                "• Add regular user: /add_user 123456789",
+                "• Add admin user: /add_user 123456789 admin",
+                "• View users: /list_users",
+                "• Database stats: /db_stats"
+            ]
+            
+            message = "\n".join(message_lines)
+            await update.message.reply_text(message)
+            
+        except Exception as e:
+            logger.error(f"Error in admin panel command: {e}")
+            await update.message.reply_text(f"❌ Error showing admin panel: {e}")
+
+    async def _cmd_add_user_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Interactive add user via button (admin command)"""
+        try:
+            # Check admin authorization first
+            if not await self._check_admin_authorization(update, context):
+                return
+            
+            await update.message.reply_text(
+                "👑 Add New User\n\n"
+                "Please send the Telegram Chat ID of the user you want to add.\n\n"
+                "Format: Just send the number (e.g., 123456789)\n\n"
+                "To add as admin: Send 'admin' after the chat ID (e.g., 123456789 admin)"
+            )
+            
+            # Set state for interactive user addition
+            chat_id = update.effective_chat.id
+            self._login_states[chat_id] = {"stage": "add_user"}
+            
+        except Exception as e:
+            logger.error(f"Error in add user button command: {e}")
+            await update.message.reply_text(f"❌ Error: {e}")
+
     async def _on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.message or not update.message.text:
             return
         text = update.message.text.strip().lower()
-        # Handle interactive login wizard
+        # Handle interactive login wizard and admin functions
         chat_id = update.effective_chat.id
         state = self._login_states.get(chat_id)
         if state:
             stage = state.get("stage")
-            if stage == "account":
+            if stage == "add_user":
+                # Handle interactive user addition
+                try:
+                    parts = update.message.text.strip().split()
+                    if len(parts) < 1:
+                        await update.message.reply_text("❌ Please provide a Telegram Chat ID.")
+                        return
+                    
+                    telegram_chat_id = int(parts[0])
+                    is_admin = len(parts) > 1 and parts[1].lower() in ['admin', 'true', '1', 'yes']
+                    
+                    # Add user to database
+                    bot_user_id = db_manager.add_bot_user(telegram_chat_id, is_admin)
+                    
+                    if bot_user_id:
+                        admin_status = "Admin" if is_admin else "Regular User"
+                        await update.message.reply_text(
+                            f"✅ Added bot user successfully!\n"
+                            f"Bot User ID: {bot_user_id}\n"
+                            f"Telegram Chat ID: {telegram_chat_id}\n"
+                            f"Role: {admin_status}"
+                        )
+                    else:
+                        await update.message.reply_text("❌ Failed to add bot user. User might already exist.")
+                    
+                except ValueError:
+                    await update.message.reply_text("❌ Invalid Telegram Chat ID. Must be a number.")
+                except Exception as e:
+                    await update.message.reply_text(f"❌ Error adding user: {e}")
+                finally:
+                    self._login_states.pop(chat_id, None)
+                return
+            elif stage == "account":
                 try:
                     state["login"] = int(update.message.text.strip())
                     state["stage"] = "password"
@@ -1316,17 +1825,42 @@ class TelegramBot:
                 state["server"] = update.message.text.strip()
                 # Attempt login
                 try:
+                    # Check if user is already logged in with a different account
+                    existing_session = self._sessions.get(chat_id)
+                    if existing_session and existing_session._login != state["login"]:
+                        await update.message.reply_text(
+                            f"You are already logged in with account {existing_session._login}. "
+                            f"Please logout first before switching to account {state['login']}."
+                        )
+                        self._login_states.pop(chat_id, None)
+                        return
+                    
                     session = MT5Connector(login=state["login"], password=state["password"], server=state["server"])
                     if not session.connect():
-                        await update.message.reply_text("Login failed. Check credentials/server and try /login again.")
+                        try:
+                            msg = session.get_last_error_message()
+                        except Exception:
+                            msg = "Login failed. Check credentials/server and try /login again."
+                        await update.message.reply_text(f"❌ {msg}")
                     else:
                         self._sessions[chat_id] = session
+                        
+                        # Get bot user info and store MT account in database
+                        bot_user = db_manager.get_bot_user_by_telegram_chat_id(chat_id)
+                        if bot_user:
+                            db_manager.add_mt_account(bot_user['bot_user_id'], state["login"])
+                            logger.info(f"Stored MT account {state['login']} for bot_user_id {bot_user['bot_user_id']}")
+                        
                         info = session.get_account_info() or {}
-                        await update.message.reply_text(f"Logged in: {info.get('login', state['login'])}")
+                        await update.message.reply_text(
+                            f"✅ Logged in to account: {info.get('login', state['login'])}\n"
+                            f"Balance: {info.get('balance', 0):.2f} {info.get('currency', '')}"
+                        )
                         try:
                             count = await self._get_upcoming_count()
+                            is_admin = self._is_user_admin(chat_id)
                             await update.message.reply_text(
-                                "Keyboard updated.", reply_markup=_build_main_reply_keyboard(count)
+                                "Keyboard updated.", reply_markup=_build_main_reply_keyboard(count, is_admin)
                             )
                         except Exception:
                             pass
@@ -1360,7 +1894,7 @@ class TelegramBot:
             await self._cmd_analyze_now(update, context)
         elif text in ("ai status", "🤖 ai status"):
             await self._cmd_ai_status(update, context)
-        elif text in ("ai train", "🤖 ai train"):
+        elif text in ("ai train", "🤖 ai train", "🚀 ai train"):
             await self._cmd_ai_train(update, context)
         elif text in ("ai performance", "🤖 ai performance", "📈 ai performance"):
             await self._cmd_ai_performance(update, context)
@@ -1372,6 +1906,15 @@ class TelegramBot:
             # kick off interactive login
             self._login_states[chat_id] = {"stage": "account"}
             await update.message.reply_text("Please enter your Account (login) number:")
+        # Admin-only button handlers
+        elif text in ("admin panel", "👑 admin panel"):
+            await self._cmd_admin_panel(update, context)
+        elif text in ("add user", "➕ add user"):
+            await self._cmd_add_user_button(update, context)
+        elif text in ("list users", "📋 list users"):
+            await self._cmd_list_users(update, context)
+        elif text in ("db stats", "📊 db stats"):
+            await self._cmd_db_stats(update, context)
         elif text == "show keyboard":
             await self._cmd_menu(update, context)
         elif text == "hide keyboard":
@@ -1406,6 +1949,12 @@ class TelegramBot:
         application.add_handler(CommandHandler("history", self._cmd_history))
         # Alerts handlers removed per request
         application.add_handler(CommandHandler("news", self._cmd_news))
+        application.add_handler(CommandHandler("sessions", self._cmd_sessions))
+        application.add_handler(CommandHandler("switch", self._cmd_switch))
+        # Admin commands
+        application.add_handler(CommandHandler("db_stats", self._cmd_db_stats))
+        application.add_handler(CommandHandler("add_user", self._cmd_add_user))
+        application.add_handler(CommandHandler("list_users", self._cmd_list_users))
 
         # Inline callbacks for show/hide keyboard
         application.add_handler(CallbackQueryHandler(self._on_inline_toggle))
@@ -1458,6 +2007,11 @@ class TelegramBot:
             application.add_handler(CommandHandler("history", self._cmd_history))
             # Alerts handlers removed per request
             application.add_handler(CommandHandler("news", self._cmd_news))
+            application.add_handler(CommandHandler("sessions", self._cmd_sessions))
+            # Admin commands
+            application.add_handler(CommandHandler("db_stats", self._cmd_db_stats))
+            application.add_handler(CommandHandler("add_user", self._cmd_add_user))
+            application.add_handler(CommandHandler("list_users", self._cmd_list_users))
             application.add_handler(CallbackQueryHandler(self._on_inline_toggle))
             # Text handler for reply keyboard buttons
             application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_text))
@@ -1500,7 +2054,8 @@ class TelegramBot:
             )
             try:
                 # Allow more time for Telegram API under load
-                fut.result(timeout=15)
+                result = fut.result(timeout=15)
+                return result
             except Exception as e:
                 # On timeout or cancellation, attempt to cancel and log at warning level
                 try:
@@ -1508,9 +2063,63 @@ class TelegramBot:
                 except Exception:
                     pass
                 logger.warning(f"Telegram notify timed out/cancelled for chat {chat_id}: {e}")
-                return
+                return None
         except Exception:
             logger.exception("Failed to send Telegram notification")
+            return None
+
+    def edit_message(self, chat_id: int, message_id: int, text: str):
+        """Edit an existing message"""
+        try:
+            if not self.application or not self._loop:
+                return
+            fut = asyncio.run_coroutine_threadsafe(
+                self.application.bot.edit_message_text(
+                    chat_id=chat_id, 
+                    message_id=message_id, 
+                    text=text
+                ),
+                self._loop,
+            )
+            try:
+                result = fut.result(timeout=10)
+                return result
+            except Exception as e:
+                try:
+                    fut.cancel()
+                except Exception:
+                    pass
+                logger.warning(f"Telegram edit_message timed out/cancelled for chat {chat_id}: {e}")
+                return None
+        except Exception:
+            logger.exception(f"Failed to edit message {message_id} in chat {chat_id}")
+            return None
+
+    def delete_message(self, chat_id: int, message_id: int):
+        """Delete a message"""
+        try:
+            if not self.application or not self._loop:
+                return
+            fut = asyncio.run_coroutine_threadsafe(
+                self.application.bot.delete_message(
+                    chat_id=chat_id, 
+                    message_id=message_id
+                ),
+                self._loop,
+            )
+            try:
+                result = fut.result(timeout=10)
+                return result
+            except Exception as e:
+                try:
+                    fut.cancel()
+                except Exception:
+                    pass
+                logger.warning(f"Telegram delete_message timed out/cancelled for chat {chat_id}: {e}")
+                return None
+        except Exception:
+            logger.exception(f"Failed to delete message {message_id} in chat {chat_id}")
+            return None
 
     def notify_all(self, text: str):
         try:

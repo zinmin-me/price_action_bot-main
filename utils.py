@@ -26,7 +26,7 @@ except ImportError as e:
     ta = None
 from config import *
 
-# Configure logging
+# Configure logging (minimal default; real config is done via LoggingUtils.setup_logging)
 logging.basicConfig(level=getattr(logging, LOG_LEVEL))
 logger = logging.getLogger(__name__)
 
@@ -442,13 +442,23 @@ class LoggingUtils:
             log_file: Log file path
             level: Logging level
         """
+        import os
+        # Ensure log directory exists
+        try:
+            log_dir = os.path.dirname(log_file)
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+        except Exception:
+            pass
+        # Force reconfigure root logger with both file and console handlers
         logging.basicConfig(
             level=getattr(logging, level),
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
             handlers=[
                 logging.FileHandler(log_file),
                 logging.StreamHandler()
-            ]
+            ],
+            force=True,
         )
     
     @staticmethod

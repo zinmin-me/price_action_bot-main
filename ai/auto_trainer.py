@@ -31,9 +31,9 @@ class AutoTrainer:
         self.training_thread = None
         
         # Training configuration
-        self.retrain_interval_hours = 24  # Retrain every 24 hours
-        self.min_data_points = 1000  # Minimum data points for training
-        self.performance_threshold = 0.55  # Retrain if accuracy drops below this
+        self.retrain_interval_hours = AI_RETRAIN_INTERVAL_HOURS
+        self.min_data_points = AI_MIN_TRAIN_SAMPLES
+        self.performance_threshold = AI_PERF_THRESHOLD
         self.max_retrain_attempts = 3
         
         # Training history
@@ -48,7 +48,7 @@ class AutoTrainer:
         }
         
         # Performance monitoring
-        self.performance_window = 100  # Monitor last 100 predictions
+        self.performance_window = AI_DRIFT_WINDOW
         self.recent_predictions = []
         self.performance_alerts = []
         
@@ -109,10 +109,8 @@ class AutoTrainer:
             # Check performance-based retraining
             if self.performance_based_retrain:
                 current_accuracy = self.ai_strategy.accuracy_metrics.get('accuracy', 0.0)
-                
                 if (current_accuracy < self.performance_threshold and 
-                    self.ai_strategy.accuracy_metrics.get('total_predictions', 0) > 50):
-                    
+                    self.ai_strategy.accuracy_metrics.get('total_predictions', 0) > AI_MIN_PREDICTIONS_FOR_PERF):
                     logger.info(f"Performance below threshold ({current_accuracy:.3f} < {self.performance_threshold})")
                     self._trigger_retrain("performance_based")
             
@@ -232,14 +230,24 @@ class AutoTrainer:
             if len(recent_predictions) < 10:
                 return
             
-            # Calculate recent accuracy
-            correct_predictions = 0
-            total_predictions = len(recent_predictions)
-            
-            for prediction in recent_predictions:
-                # This would need to be updated based on actual market outcomes
-                # For now, we'll use the AI strategy's accuracy metrics
-                pass
+            # Estimate drift via recent loss rate using accuracy metrics deltas
+            total_predictions = self.ai_strategy.accuracy_metrics.get('total_predictions', 0)
+            correct_predictions = self.ai_strategy.accuracy_metrics.get('correct_predictions', 0)
+            # Naive drift proxy: if accuracy over the window would imply high loss rate, alert
+            if total_predictions > 0:
+                current_accuracy = self.ai_strategy.accuracy_metrics.get('accuracy', 0.0)
+                loss_rate = 1.0 - current_accuracy
+                if AI_DRIFT_CHECK_ENABLED and loss_rate >= AI_DRIFT_LOSS_RATE_ALERT and total_predictions >= AI_MIN_PREDICTIONS_FOR_PERF:
+                    alert = {
+                        'timestamp': datetime.now().isoformat(),
+                        'type': 'drift_suspected',
+                        'loss_rate': loss_rate,
+                        'threshold': AI_DRIFT_LOSS_RATE_ALERT
+                    }
+                    self.performance_alerts.append(alert)
+                    logger.warning(f"AI drift suspected: loss_rate={loss_rate:.3f} >= {AI_DRIFT_LOSS_RATE_ALERT}")
+                    if AI_AUTORETRAIN_ON_DRIFT:
+                        self._trigger_retrain("drift_based")
             
             # Check for performance alerts
             current_accuracy = self.ai_strategy.accuracy_metrics.get('accuracy', 0.0)
@@ -349,7 +357,7 @@ class AutoTrainer:
             with open(filepath, 'w') as f:
                 json.dump(history_data, f, indent=2)
             
-            logger.info(f"Saved training history to {filepath}")
+            logger.info("Saved training history successfully")
             
         except Exception as e:
             logger.error(f"Error saving training history: {e}")
@@ -376,7 +384,7 @@ class AutoTrainer:
             self.training_stats = history_data.get('training_stats', self.training_stats)
             self.performance_alerts = history_data.get('performance_alerts', [])
             
-            logger.info(f"Loaded training history from {filepath}")
+            logger.info("Loaded training history successfully")
             
         except Exception as e:
             logger.error(f"Error loading training history: {e}")

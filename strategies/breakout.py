@@ -18,6 +18,10 @@ from datetime import datetime
 
 from config import *
 from utils import TechnicalIndicators, SupportResistance, RiskManagement, LoggingUtils
+from ta.trend import MACD, EMAIndicator
+from ta.momentum import StochasticOscillator
+from ta.volatility import BollingerBands
+from ta.volume import OnBalanceVolumeIndicator
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +64,24 @@ class BreakoutStrategy:
             atr = TechnicalIndicators.atr(df['high'], df['low'], df['close'], self.atr_period)
             current_price = df['close'].iloc[-1]
             current_atr = atr.iloc[-1]
+            # Optional additional filters
+            macd_line = macd_signal = None
+            stoch_k = None
+            bb_high = bb_low = None
+            try:
+                if INDICATORS_ENABLE_MACD and PANDAS_AVAILABLE:
+                    macd = MACD(close=df['close'], window_fast=MACD_FAST, window_slow=MACD_SLOW, window_sign=MACD_SIGNAL)
+                    macd_line = macd.macd()
+                    macd_signal = macd.macd_signal()
+                if INDICATORS_ENABLE_STOCH and PANDAS_AVAILABLE:
+                    stoch = StochasticOscillator(high=df['high'], low=df['low'], close=df['close'], window=STOCH_K, smooth_window=STOCH_SMOOTH)
+                    stoch_k = stoch.stoch()
+                if INDICATORS_ENABLE_BB and PANDAS_AVAILABLE:
+                    bb = BollingerBands(close=df['close'], window=BB_PERIOD, window_dev=BB_STD)
+                    bb_high = bb.bollinger_hband()
+                    bb_low = bb.bollinger_lband()
+            except Exception:
+                pass
             
             # Find consolidation patterns
             consolidation = self._find_consolidation(df)
@@ -67,8 +89,34 @@ class BreakoutStrategy:
             # Check for breakouts
             breakout_signal = self._check_breakout(df, consolidation, current_price, current_atr)
             
+            # EMA / VWAP / RSI fast / OBV
+            ema9 = ema20 = ema50 = ema200 = None
+            vwap = None
+            rsi_fast = None
+            obv = None
+            try:
+                if PANDAS_AVAILABLE:
+                    ema9 = EMAIndicator(close=df['close'], window=EMA_FAST_SHORT).ema_indicator()
+                    ema20 = EMAIndicator(close=df['close'], window=EMA_SLOW_SHORT).ema_indicator()
+                    ema50 = EMAIndicator(close=df['close'], window=EMA_MEDIUM).ema_indicator()
+                    ema200 = EMAIndicator(close=df['close'], window=EMA_LONG).ema_indicator()
+                if VWAP_ENABLED and PANDAS_AVAILABLE and 'tick_volume' in df.columns:
+                    tp = (df['high'] + df['low'] + df['close']) / 3.0
+                    cum_v = df['tick_volume'].cumsum().replace(0, np.nan)
+                    vwap = (tp * df['tick_volume']).cumsum() / cum_v
+                if PANDAS_AVAILABLE:
+                    rsi_fast = TechnicalIndicators.rsi(df['close'], RSI_FAST_PERIOD)
+                if OBV_ENABLED and PANDAS_AVAILABLE and 'tick_volume' in df.columns:
+                    obv = OnBalanceVolumeIndicator(close=df['close'], volume=df['tick_volume']).on_balance_volume()
+            except Exception:
+                pass
+
             # Generate signals
-            signal = self._generate_signal(breakout_signal, current_price, current_atr)
+            signal = self._generate_signal(breakout_signal, current_price, current_atr,
+                                           macd_line=macd_line, macd_signal=macd_signal,
+                                           stoch_k=stoch_k, bb_high=bb_high, bb_low=bb_low,
+                                           ema9=ema9, ema20=ema20, ema50=ema50, ema200=ema200,
+                                           vwap=vwap, rsi_fast=rsi_fast, obv=obv)
             
             return {
                 'signal': signal['type'],
@@ -236,7 +284,11 @@ class BreakoutStrategy:
         
         return True
     
-    def _generate_signal(self, breakout_signal: Dict, current_price: float, atr: float) -> Dict:
+    def _generate_signal(self, breakout_signal: Dict, current_price: float, atr: float,
+                         macd_line=None, macd_signal=None, stoch_k=None,
+                         bb_high=None, bb_low=None,
+                         ema9=None, ema20=None, ema50=None, ema200=None,
+                         vwap=None, rsi_fast=None, obv=None) -> Dict:
         """
         Generate trading signal based on breakout analysis
         
@@ -249,6 +301,26 @@ class BreakoutStrategy:
             Dict: Trading signal
         """
         if breakout_signal['type'] == 'bullish_breakout':
+            # Indicator gates for long
+            try:
+                if INDICATORS_ENABLE_MACD and macd_line is not None and macd_signal is not None:
+                    if pd.isna(macd_line.iloc[-1]) or pd.isna(macd_signal.iloc[-1]) or macd_line.iloc[-1] <= macd_signal.iloc[-1]:
+                        return {'type': 'no_signal', 'reason': 'MACD not supportive'}
+                if INDICATORS_ENABLE_STOCH and stoch_k is not None and stoch_k.iloc[-1] >= STOCH_OVERBOUGHT:
+                    return {'type': 'no_signal', 'reason': 'Stoch overbought'}
+                if INDICATORS_ENABLE_BB and bb_high is not None and current_price > bb_high.iloc[-1]:
+                    return {'type': 'no_signal', 'reason': 'Price above BB'}
+                # EMA alignment and VWAP/rsi_fast/OBV
+                if ema9 is not None and ema20 is not None and ema9.iloc[-1] <= ema20.iloc[-1]:
+                    return {'type': 'no_signal', 'reason': 'EMA9/20 not aligned'}
+                if ema50 is not None and current_price <= ema50.iloc[-1]:
+                    return {'type': 'no_signal', 'reason': 'Below EMA50'}
+                if vwap is not None and current_price < vwap.iloc[-1]:
+                    return {'type': 'no_signal', 'reason': 'Below VWAP'}
+                if rsi_fast is not None and not pd.isna(rsi_fast.iloc[-1]) and rsi_fast.iloc[-1] > 80:
+                    return {'type': 'no_signal', 'reason': 'Fast RSI too high'}
+            except Exception:
+                pass
             # Calculate stop loss and take profit
             breakout_level = breakout_signal['breakout_level']
             stop_loss = breakout_level - (atr * self.atr_multiplier)
@@ -265,6 +337,26 @@ class BreakoutStrategy:
             }
         
         elif breakout_signal['type'] == 'bearish_breakout':
+            # Indicator gates for short
+            try:
+                if INDICATORS_ENABLE_MACD and macd_line is not None and macd_signal is not None:
+                    if pd.isna(macd_line.iloc[-1]) or pd.isna(macd_signal.iloc[-1]) or macd_line.iloc[-1] >= macd_signal.iloc[-1]:
+                        return {'type': 'no_signal', 'reason': 'MACD not supportive'}
+                if INDICATORS_ENABLE_STOCH and stoch_k is not None and stoch_k.iloc[-1] <= STOCH_OVERSOLD:
+                    return {'type': 'no_signal', 'reason': 'Stoch oversold'}
+                if INDICATORS_ENABLE_BB and bb_low is not None and current_price < bb_low.iloc[-1]:
+                    return {'type': 'no_signal', 'reason': 'Price below BB'}
+                # EMA alignment and VWAP/rsi_fast/OBV
+                if ema9 is not None and ema20 is not None and ema9.iloc[-1] >= ema20.iloc[-1]:
+                    return {'type': 'no_signal', 'reason': 'EMA9/20 not aligned'}
+                if ema50 is not None and current_price >= ema50.iloc[-1]:
+                    return {'type': 'no_signal', 'reason': 'Above EMA50'}
+                if vwap is not None and current_price > vwap.iloc[-1]:
+                    return {'type': 'no_signal', 'reason': 'Above VWAP'}
+                if rsi_fast is not None and not pd.isna(rsi_fast.iloc[-1]) and rsi_fast.iloc[-1] < 20:
+                    return {'type': 'no_signal', 'reason': 'Fast RSI too low'}
+            except Exception:
+                pass
             # Calculate stop loss and take profit
             breakout_level = breakout_signal['breakout_level']
             stop_loss = breakout_level + (atr * self.atr_multiplier)

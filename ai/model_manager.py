@@ -328,28 +328,95 @@ class ModelManager:
         if X.size == 0:
             return np.array([]), np.array([])
         
+        # Ensure contiguous array to avoid LightGBM subset warnings
+        try:
+            if isinstance(X, pd.DataFrame):
+                X_use = X.values.copy()
+            else:
+                X_use = np.ascontiguousarray(X)
+        except Exception:
+            X_use = X
+        
         try:
             if model_name == 'ensemble' and self.ensemble_model is not None:
                 model = self.ensemble_model
             elif model_name in self.models:
                 model = self.models[model_name]
             else:
-                logger.error(f"Model {model_name} not found")
-                return np.array([]), np.array([])
+                # Fallback to best available model
+                best_name, best_model = self.get_best_model()
+                if best_model is None:
+                    logger.error(f"Model {model_name} not found and no fallback available")
+                    return np.array([]), np.array([])
+                model = best_model
 
-            # If the model is a pipeline, it encapsulates its own preprocessing
-            # Always call the model directly on X.
-            predictions = model.predict(X)
-
+            # Try prediction; if model (e.g., ensemble) is not fitted, try manual soft-ensemble, then fallback
             probabilities = None
-            if hasattr(model, 'predict_proba'):
-                probabilities = model.predict_proba(X)
+            try:
+                predictions = model.predict(X_use)
+                if hasattr(model, 'predict_proba'):
+                    probabilities = model.predict_proba(X_use)
+            except Exception as e:
+                logger.error(f"Error making predictions with {model_name}: {e}")
+                # Try manual soft-ensemble across available models with predict_proba
+                try:
+                    pred_me, proba_me = self._manual_soft_ensemble(X_use)
+                    if pred_me.size:
+                        return pred_me, proba_me
+                except Exception as e_me:
+                    logger.warning(f"Manual ensemble failed: {e_me}")
+                # Fallback to best single model
+                best_name, best_model = self.get_best_model()
+                if best_model is None or best_model is model:
+                    return np.array([]), np.array([])
+                try:
+                    predictions = best_model.predict(X_use)
+                    if hasattr(best_model, 'predict_proba'):
+                        probabilities = best_model.predict_proba(X_use)
+                except Exception as e2:
+                    logger.error(f"Fallback model prediction failed: {e2}")
+                    return np.array([]), np.array([])
             
             return predictions, probabilities
             
         except Exception as e:
             logger.error(f"Error making predictions with {model_name}: {e}")
             return np.array([]), np.array([])
+
+    def _manual_soft_ensemble(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Average predict_proba across available classifiers to emulate soft voting.
+        Returns (predictions, averaged_probabilities). Assumes 3 classes [0,1,2].
+        """
+        import numpy as _np
+        # Ensure contiguous
+        try:
+            if isinstance(X, pd.DataFrame):
+                X_use = X.values.copy()
+            else:
+                X_use = _np.ascontiguousarray(X)
+        except Exception:
+            X_use = X
+        probas = []
+        for name, model in self.models.items():
+            try:
+                if hasattr(model, 'predict_proba'):
+                    p = model.predict_proba(X_use)
+                    # Align to 3 classes if model has class subset
+                    cls = getattr(model, 'classes_', None)
+                    if cls is not None and len(cls) != 3:
+                        aligned = _np.zeros((p.shape[0], 3))
+                        for idx, c in enumerate(cls):
+                            if int(c) in (0,1,2):
+                                aligned[:, int(c)] = p[:, idx]
+                        p = aligned
+                    probas.append(p)
+            except Exception:
+                continue
+        if not probas:
+            return _np.array([]), _np.array([])
+        avg = _np.mean(probas, axis=0)
+        preds = _np.argmax(avg, axis=1)
+        return preds, avg
     
     def get_model_performance(self, model_name: str = None) -> Dict:
         """
@@ -365,6 +432,95 @@ class ModelManager:
             return self.model_metadata.get(model_name, {})
         else:
             return self.model_metadata
+
+    # --- Explainability helpers ---
+    def get_global_feature_importance(self, feature_names: List[str]) -> Dict[str, Dict[str, float]]:
+        """Return global feature importances per model when supported."""
+        importances: Dict[str, Dict[str, float]] = {}
+        try:
+            for name, model in self.models.items():
+                imp_map: Dict[str, float] = {}
+                try:
+                    if hasattr(model, 'feature_importances_'):
+                        vals = model.feature_importances_
+                        for i, f in enumerate(feature_names[:len(vals)]):
+                            imp_map[f] = float(vals[i])
+                    elif hasattr(model, 'coef_'):
+                        coef = getattr(model, 'coef_', None)
+                        if coef is not None:
+                            arr = coef[0] if len(coef.shape) > 1 else coef
+                            for i, f in enumerate(feature_names[:len(arr)]):
+                                imp_map[f] = abs(float(arr[i]))
+                except Exception:
+                    imp_map = {}
+                if imp_map:
+                    # Normalize to sum=1
+                    s = sum(imp_map.values()) or 1.0
+                    importances[name] = {k: v / s for k, v in imp_map.items()}
+        except Exception:
+            pass
+        return importances
+
+    def get_local_contributions(self, X: np.ndarray, feature_names: List[str], model_name: str = None) -> Optional[Dict[str, float]]:
+        """Return per-sample feature contributions using model-native pred_contribs when available.
+        Supports xgboost and lightgbm. Falls back to None if unsupported.
+        """
+        try:
+            target_model = None
+            if model_name and model_name in self.models:
+                target_model = self.models[model_name]
+            elif self.ensemble_model is not None:
+                # fallback to best individual model for contributions
+                best_name, best_model = self.get_best_model()
+                target_model = best_model
+            # XGBoost
+            try:
+                import xgboost as _xgb
+                if hasattr(target_model, 'get_booster'):
+                    dmx = _xgb.DMatrix(X)
+                    contribs = target_model.get_booster().predict(dmx, pred_contribs=True)
+                    vals = contribs[0]
+                    return {feature_names[i]: float(vals[i]) for i in range(min(len(vals), len(feature_names)))}
+            except Exception:
+                pass
+            # LightGBM
+            try:
+                if hasattr(target_model, 'booster_'):
+                    vals = target_model.booster_.predict(X, pred_contrib=True)
+                    row = vals[0]
+                    return {feature_names[i]: float(row[i]) for i in range(min(len(row), len(feature_names)))}
+            except Exception:
+                pass
+            return None
+        except Exception:
+            return None
+
+    def explain(self, X: np.ndarray, feature_names: List[str]) -> Dict[str, List[Tuple[str, float]]]:
+        """Produce a simple explanation: top positive/negative contributors if available."""
+        try:
+            contribs = self.get_local_contributions(X, feature_names)
+            if not contribs:
+                # Fall back to global importances
+                global_imps = self.get_global_feature_importance(feature_names) or {}
+                # Merge average across models
+                avg: Dict[str, float] = {}
+                for _, m in global_imps.items():
+                    for f, v in m.items():
+                        avg[f] = avg.get(f, 0.0) + v
+                if avg:
+                    total_models = max(1, len(global_imps))
+                    for f in list(avg.keys()):
+                        avg[f] /= total_models
+                    top = sorted(avg.items(), key=lambda x: x[1], reverse=True)[:5]
+                    return {'top_positive': top, 'top_negative': []}
+                return {'top_positive': [], 'top_negative': []}
+            # Split positive/negative
+            items = sorted(contribs.items(), key=lambda x: x[1], reverse=True)
+            top_pos = [(k, v) for k, v in items if v > 0][:5]
+            top_neg = [(k, v) for k, v in reversed(items) if v < 0][:5]
+            return {'top_positive': top_pos, 'top_negative': top_neg}
+        except Exception:
+            return {'top_positive': [], 'top_negative': []}
     
     def hyperparameter_tuning(self, X: np.ndarray, y: np.ndarray, 
                              model_name: str, param_grid: Dict) -> Dict:
@@ -536,17 +692,26 @@ class ModelManager:
                     # Save scikit-learn model
                     joblib.dump(self.models[model_name], model_path)
                 
-                logger.info(f"Saved {model_name} model to {model_path}")
+                logger.info(f"Saved {model_name} model successfully")
                 
             except Exception as e:
                 logger.error(f"Error saving {model_name} model: {e}")
+        
+        # Save ensemble model if it exists and is fitted
+        if self.ensemble_model is not None and hasattr(self.ensemble_model, 'estimators_'):
+            try:
+                ensemble_path = os.path.join(self.model_dir, "ensemble_model.joblib")
+                joblib.dump(self.ensemble_model, ensemble_path)
+                logger.info("Saved ensemble model successfully")
+            except Exception as e:
+                logger.error(f"Error saving ensemble model: {e}")
         
         # Save metadata
         metadata_path = os.path.join(self.model_dir, "model_metadata.json")
         try:
             with open(metadata_path, 'w') as f:
                 json.dump(self.model_metadata, f, indent=2)
-            logger.info(f"Saved model metadata to {metadata_path}")
+            logger.info("Saved model metadata successfully")
         except Exception as e:
             logger.error(f"Error saving metadata: {e}")
     
@@ -592,6 +757,24 @@ class ModelManager:
             except Exception as e:
                 logger.error(f"Error loading {model_name} model: {e}")
                 loading_results[model_name] = False
+        
+        # Load ensemble model if it exists
+        ensemble_path = os.path.join(self.model_dir, "ensemble_model.joblib")
+        ensemble_loaded = False
+        try:
+            if os.path.exists(ensemble_path):
+                self.ensemble_model = joblib.load(ensemble_path)
+                logger.info("Loaded ensemble model")
+                ensemble_loaded = True
+            else:
+                logger.info("No ensemble model found, will create new one if needed")
+        except Exception as e:
+            logger.error(f"Error loading ensemble model: {e}")
+            self.ensemble_model = None
+        
+        # Create ensemble model if not loaded and we have individual models
+        if not ensemble_loaded and self.models:
+            self._create_ensemble_model()
         
         # Load metadata
         metadata_path = os.path.join(self.model_dir, "model_metadata.json")
