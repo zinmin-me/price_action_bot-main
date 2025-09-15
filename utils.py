@@ -366,26 +366,108 @@ class TrendAnalysis:
         return higher_highs, lower_lows
 
 class RiskManagement:
-    """Risk management utilities"""
+    """Enhanced risk management utilities with dynamic position sizing"""
     
     @staticmethod
     def calculate_position_size(account_balance: float, risk_percentage: float, 
-                              stop_loss_points: int, point_value: float) -> float:
+                              stop_loss_points: int, point_value: float,
+                              signal_confidence: float = 50.0, 
+                              market_volatility: float = 1.0,
+                              confluence_score: float = 50.0) -> float:
         """
-        Calculate position size based on risk management
+        Calculate dynamic position size based on multiple factors
         
         Args:
             account_balance: Account balance
-            risk_percentage: Risk percentage per trade
+            risk_percentage: Base risk percentage per trade
             stop_loss_points: Stop loss in points
             point_value: Point value
+            signal_confidence: Signal confidence (0-100)
+            market_volatility: Market volatility multiplier (1.0 = normal)
+            confluence_score: Confluence score (0-100)
             
         Returns:
             float: Calculated position size
         """
+        # Base position size calculation
         risk_amount = account_balance * (risk_percentage / 100)
-        position_size = risk_amount / (stop_loss_points * point_value)
-        return max(0.01, min(position_size, 1.0))  # Limit between 0.01 and 1.0
+        base_position_size = risk_amount / (stop_loss_points * point_value)
+        
+        # Dynamic adjustments
+        if DYNAMIC_POSITION_SIZING:
+            # Confidence adjustment (0.5x to 1.5x)
+            confidence_multiplier = 0.5 + (signal_confidence / 100) * 1.0
+            
+            # Volatility adjustment (reduce size in high volatility)
+            if VOLATILITY_ADJUSTMENT:
+                volatility_multiplier = max(0.3, min(1.2, 1.0 / market_volatility))
+            else:
+                volatility_multiplier = 1.0
+            
+            # Confluence adjustment (0.7x to 1.3x)
+            confluence_multiplier = 0.7 + (confluence_score / 100) * 0.6
+            
+            # Apply all adjustments
+            adjusted_position_size = (base_position_size * 
+                                    confidence_multiplier * 
+                                    volatility_multiplier * 
+                                    confluence_multiplier)
+        else:
+            adjusted_position_size = base_position_size
+        
+        # Apply limits
+        return max(MIN_POSITION_SIZE, min(adjusted_position_size, MAX_POSITION_SIZE))
+    
+    @staticmethod
+    def get_market_context(df) -> Dict:
+        """
+        Analyze market context for better trading decisions
+        
+        Args:
+            df: OHLC DataFrame
+            
+        Returns:
+            Dict: Market context analysis
+        """
+        if len(df) < 20:
+            return {'volatility': 1.0, 'trend_strength': 0.5, 'session': 'unknown'}
+        
+        # Calculate volatility
+        atr = TechnicalIndicators.atr(df['high'], df['low'], df['close'], 14)
+        current_atr = atr.iloc[-1]
+        avg_atr = atr.tail(20).mean()
+        volatility_ratio = current_atr / avg_atr if avg_atr > 0 else 1.0
+        
+        # Calculate trend strength
+        sma_20 = TechnicalIndicators.sma(df['close'], 20)
+        sma_50 = TechnicalIndicators.sma(df['close'], 50)
+        current_price = df['close'].iloc[-1]
+        
+        if current_price > sma_20.iloc[-1] > sma_50.iloc[-1]:
+            trend_strength = min(1.0, (current_price - sma_50.iloc[-1]) / (sma_50.iloc[-1] * 0.01))
+        elif current_price < sma_20.iloc[-1] < sma_50.iloc[-1]:
+            trend_strength = min(1.0, (sma_50.iloc[-1] - current_price) / (sma_50.iloc[-1] * 0.01))
+        else:
+            trend_strength = 0.3  # Sideways market
+        
+        # Determine trading session
+        current_hour = datetime.now().hour
+        if 8 <= current_hour <= 16:
+            session = 'london'
+        elif 20 <= current_hour <= 22:
+            session = 'new_york'
+        elif 0 <= current_hour <= 6:
+            session = 'asian'
+        else:
+            session = 'overlap'
+        
+        return {
+            'volatility': volatility_ratio,
+            'trend_strength': trend_strength,
+            'session': session,
+            'atr': current_atr,
+            'avg_atr': avg_atr
+        }
     
     @staticmethod
     def calculate_stop_loss(entry_price: float, direction: str, atr: float, 

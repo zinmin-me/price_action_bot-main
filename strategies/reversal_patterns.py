@@ -278,7 +278,7 @@ class ReversalPatternsStrategy:
     
     def _check_confluence(self, patterns: List[Dict], rsi: float, df) -> Dict:
         """
-        Check for confluence with technical indicators
+        Enhanced confluence analysis with multiple confirmation criteria
         
         Args:
             patterns: List of detected patterns
@@ -292,7 +292,11 @@ class ReversalPatternsStrategy:
             'rsi_alignment': False,
             'trend_context': 'neutral',
             'volume_confirmation': False,
-            'multiple_patterns': len(patterns) > 1
+            'multiple_patterns': len(patterns) > 1,
+            'support_resistance': False,
+            'momentum_confirmation': False,
+            'session_context': False,
+            'confluence_score': 0
         }
         
         if not patterns:
@@ -300,26 +304,88 @@ class ReversalPatternsStrategy:
         
         # Check RSI alignment with patterns
         latest_pattern = patterns[-1]  # Most recent pattern
+        confluence_score = 0
         
         if latest_pattern['direction'] == 'bullish':
-            confluence['rsi_alignment'] = rsi < self.rsi_overbought and rsi > 30
+            # RSI should be oversold or recovering from oversold
+            if rsi < 35 and rsi > 25:  # Oversold but not extreme
+                confluence['rsi_alignment'] = True
+                confluence_score += 25
+            elif rsi < 45 and rsi > 30:  # Recovering from oversold
+                confluence['rsi_alignment'] = True
+                confluence_score += 15
             confluence['trend_context'] = 'bullish'
         elif latest_pattern['direction'] == 'bearish':
-            confluence['rsi_alignment'] = rsi > self.rsi_oversold and rsi < 70
+            # RSI should be overbought or declining from overbought
+            if rsi > 65 and rsi < 75:  # Overbought but not extreme
+                confluence['rsi_alignment'] = True
+                confluence_score += 25
+            elif rsi > 55 and rsi < 70:  # Declining from overbought
+                confluence['rsi_alignment'] = True
+                confluence_score += 15
             confluence['trend_context'] = 'bearish'
         
-        # Check volume confirmation
-        if len(df) >= 2 and 'tick_volume' in df.columns:
+        # Check volume confirmation (enhanced)
+        if len(df) >= 5 and 'tick_volume' in df.columns:
             current_volume = df['tick_volume'].iloc[-1]
-            avg_volume = df['tick_volume'].tail(10).mean()
-            confluence['volume_confirmation'] = current_volume > avg_volume * 1.2
+            avg_volume = df['tick_volume'].tail(20).mean()
+            volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1
+            
+            if volume_ratio > 1.5:  # Strong volume
+                confluence['volume_confirmation'] = True
+                confluence_score += 20
+            elif volume_ratio > 1.2:  # Moderate volume
+                confluence_score += 10
         
+        # Check support/resistance context
+        if len(df) >= 20:
+            current_price = df['close'].iloc[-1]
+            recent_high = df['high'].tail(20).max()
+            recent_low = df['low'].tail(20).min()
+            
+            if latest_pattern['direction'] == 'bullish':
+                # Check if near support level
+                if current_price <= recent_low * 1.002:  # Within 0.2% of recent low
+                    confluence['support_resistance'] = True
+                    confluence_score += 20
+            elif latest_pattern['direction'] == 'bearish':
+                # Check if near resistance level
+                if current_price >= recent_high * 0.998:  # Within 0.2% of recent high
+                    confluence['support_resistance'] = True
+                    confluence_score += 20
+        
+        # Check momentum confirmation
+        if len(df) >= 3:
+            if latest_pattern['direction'] == 'bullish':
+                # Check for bullish momentum divergence
+                price_change = df['close'].iloc[-1] - df['close'].iloc[-3]
+                if price_change > 0 and rsi > df['close'].rolling(14).apply(lambda x: TechnicalIndicators.rsi(x, 14).iloc[-1] if len(x) >= 14 else 50).iloc[-3]:
+                    confluence['momentum_confirmation'] = True
+                    confluence_score += 15
+            elif latest_pattern['direction'] == 'bearish':
+                # Check for bearish momentum divergence
+                price_change = df['close'].iloc[-1] - df['close'].iloc[-3]
+                if price_change < 0 and rsi < df['close'].rolling(14).apply(lambda x: TechnicalIndicators.rsi(x, 14).iloc[-1] if len(x) >= 14 else 50).iloc[-3]:
+                    confluence['momentum_confirmation'] = True
+                    confluence_score += 15
+        
+        # Check session context
+        current_hour = datetime.now().hour
+        if 8 <= current_hour <= 16 or 20 <= current_hour <= 22:  # Active trading hours
+            confluence['session_context'] = True
+            confluence_score += 10
+        
+        # Multiple patterns bonus
+        if confluence['multiple_patterns']:
+            confluence_score += 10
+        
+        confluence['confluence_score'] = confluence_score
         return confluence
     
     def _generate_signal(self, patterns: List[Dict], confluence: Dict, 
                         current_price: float, atr: float, rsi: float) -> Dict:
         """
-        Generate trading signal based on pattern analysis
+        Generate trading signal based on enhanced pattern analysis
         
         Args:
             patterns: List of detected patterns
@@ -337,19 +403,32 @@ class ReversalPatternsStrategy:
         # Get the strongest recent pattern
         latest_pattern = max(patterns, key=lambda p: p['strength'])
         
-        # Check if pattern is strong enough
-        if latest_pattern['strength'] < 50:
-            return {'type': 'no_signal'}
+        # Enhanced signal filtering
+        # 1. Pattern strength threshold (increased)
+        if latest_pattern['strength'] < 60:
+            return {'type': 'no_signal', 'reason': 'Pattern strength too low'}
         
-        # Check confluence
+        # 2. Confluence score threshold (new)
+        if confluence['confluence_score'] < 50:
+            return {'type': 'no_signal', 'reason': 'Insufficient confluence'}
+        
+        # 3. RSI alignment (required)
         if not confluence['rsi_alignment']:
-            return {'type': 'no_signal'}
+            return {'type': 'no_signal', 'reason': 'RSI not aligned'}
+        
+        # 4. Support/Resistance context (preferred)
+        if not confluence['support_resistance']:
+            return {'type': 'no_signal', 'reason': 'Not at key level'}
+        
+        # 5. Session context (preferred)
+        if not confluence['session_context']:
+            return {'type': 'no_signal', 'reason': 'Outside active hours'}
         
         # Generate signal based on pattern direction
         if latest_pattern['direction'] == 'bullish':
-            # Calculate stop loss and take profit
+            # Calculate stop loss and take profit with better risk management
             stop_loss = RiskManagement.calculate_stop_loss(current_price, 'buy', atr, self.atr_multiplier)
-            take_profit = RiskManagement.calculate_take_profit(current_price, stop_loss, 'buy', 2.0)
+            take_profit = RiskManagement.calculate_take_profit(current_price, stop_loss, 'buy', 2.5)  # Better R:R
             
             return {
                 'type': 'buy',
@@ -358,13 +437,14 @@ class ReversalPatternsStrategy:
                 'stop_loss': stop_loss,
                 'take_profit': take_profit,
                 'confidence': self._calculate_confidence(latest_pattern, confluence, rsi),
-                'pattern_type': latest_pattern['type']
+                'pattern_type': latest_pattern['type'],
+                'confluence_score': confluence['confluence_score']
             }
         
         elif latest_pattern['direction'] == 'bearish':
-            # Calculate stop loss and take profit
+            # Calculate stop loss and take profit with better risk management
             stop_loss = RiskManagement.calculate_stop_loss(current_price, 'sell', atr, self.atr_multiplier)
-            take_profit = RiskManagement.calculate_take_profit(current_price, stop_loss, 'sell', 2.0)
+            take_profit = RiskManagement.calculate_take_profit(current_price, stop_loss, 'sell', 2.5)  # Better R:R
             
             return {
                 'type': 'sell',
@@ -373,7 +453,8 @@ class ReversalPatternsStrategy:
                 'stop_loss': stop_loss,
                 'take_profit': take_profit,
                 'confidence': self._calculate_confidence(latest_pattern, confluence, rsi),
-                'pattern_type': latest_pattern['type']
+                'pattern_type': latest_pattern['type'],
+                'confluence_score': confluence['confluence_score']
             }
         
         return {'type': 'no_signal'}

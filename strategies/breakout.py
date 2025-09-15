@@ -230,7 +230,7 @@ class BreakoutStrategy:
     def _confirm_breakout(self, df, direction: str, 
                          breakout_level: float, atr: float) -> bool:
         """
-        Confirm breakout with additional criteria
+        Confirm breakout with enhanced criteria to reduce false breakouts
         
         Args:
             df: OHLC DataFrame
@@ -241,48 +241,71 @@ class BreakoutStrategy:
         Returns:
             bool: True if breakout is confirmed
         """
-        if len(df) < self.breakout_confirmation_bars + 1:
+        if len(df) < self.breakout_confirmation_bars + 5:
             return False
         
         # Get recent candles for confirmation
         recent_candles = df.tail(self.breakout_confirmation_bars + 1)
         
-        # Check for sustained breakout
+        # Enhanced confirmation criteria
+        confirmation_score = 0
+        max_score = 100
+        
+        # 1. Sustained breakout (25 points)
         if direction == 'bullish':
-            # Check if recent candles are above breakout level
             above_level = sum(recent_candles['close'] > breakout_level)
-            if above_level < self.breakout_confirmation_bars:
-                return False
-            
-            # Check for bullish momentum
-            price_momentum = recent_candles['close'].iloc[-1] - recent_candles['close'].iloc[-2]
-            if price_momentum <= 0:
-                return False
-        
+            if above_level >= self.breakout_confirmation_bars:
+                confirmation_score += 25
         else:  # bearish
-            # Check if recent candles are below breakout level
             below_level = sum(recent_candles['close'] < breakout_level)
-            if below_level < self.breakout_confirmation_bars:
-                return False
-            
-            # Check for bearish momentum
-            price_momentum = recent_candles['close'].iloc[-1] - recent_candles['close'].iloc[-2]
-            if price_momentum >= 0:
-                return False
+            if below_level >= self.breakout_confirmation_bars:
+                confirmation_score += 25
         
-        # Check for volume confirmation (if available)
+        # 2. Strong momentum (20 points)
+        if direction == 'bullish':
+            price_momentum = recent_candles['close'].iloc[-1] - recent_candles['close'].iloc[-3]
+            if price_momentum > atr * 0.3:  # Strong upward momentum
+                confirmation_score += 20
+        else:  # bearish
+            price_momentum = recent_candles['close'].iloc[-3] - recent_candles['close'].iloc[-1]
+            if price_momentum > atr * 0.3:  # Strong downward momentum
+                confirmation_score += 20
+        
+        # 3. Volume confirmation (20 points)
         if 'tick_volume' in df.columns:
             recent_volume = recent_candles['tick_volume'].mean()
             avg_volume = df['tick_volume'].tail(50).mean()
-            if recent_volume < avg_volume * self.min_volume_multiplier:
-                return False
+            volume_ratio = recent_volume / avg_volume if avg_volume > 0 else 1
+            if volume_ratio >= self.min_volume_multiplier:
+                confirmation_score += 20
+            elif volume_ratio >= 1.5:  # At least 50% above average
+                confirmation_score += 10
         
-        # Check for significant breakout (at least 0.5 ATR)
+        # 4. Significant breakout distance (15 points)
         breakout_distance = abs(recent_candles['close'].iloc[-1] - breakout_level)
-        if breakout_distance < atr * 0.5:
-            return False
+        if breakout_distance >= atr * 0.8:  # Strong breakout
+            confirmation_score += 15
+        elif breakout_distance >= atr * 0.5:  # Moderate breakout
+            confirmation_score += 10
         
-        return True
+        # 5. No immediate pullback (10 points)
+        if direction == 'bullish':
+            min_price = recent_candles['low'].min()
+            if min_price > breakout_level * 0.999:  # No significant pullback
+                confirmation_score += 10
+        else:  # bearish
+            max_price = recent_candles['high'].max()
+            if max_price < breakout_level * 1.001:  # No significant pullback
+                confirmation_score += 10
+        
+        # 6. Market session context (10 points)
+        current_hour = datetime.now().hour
+        # Avoid trading during low liquidity periods
+        if 8 <= current_hour <= 16 or 20 <= current_hour <= 22:  # Active trading hours
+            confirmation_score += 10
+        
+        # Require at least 70% confirmation score
+        return confirmation_score >= 70
     
     def _generate_signal(self, breakout_signal: Dict, current_price: float, atr: float,
                          macd_line=None, macd_signal=None, stoch_k=None,
@@ -410,7 +433,7 @@ class BreakoutStrategy:
     
     def should_exit_position(self, position: Dict, df) -> Dict:
         """
-        Check if position should be exited
+        Enhanced exit logic to prevent premature exits and improve risk management
         
         Args:
             position: Current position data
@@ -425,43 +448,76 @@ class BreakoutStrategy:
         try:
             current_price = df['close'].iloc[-1]
             atr = TechnicalIndicators.atr(df['high'], df['low'], df['close'], self.atr_period).iloc[-1]
+            entry_price = position['price_open']
             
-            # Check for false breakout (price returns to consolidation)
+            # Calculate current P&L
             if position['type'] == 'buy':
-                # Check if price has returned below breakout level
-                entry_price = position['price_open']
-                if current_price < entry_price * 0.998:  # 0.2% below entry
+                pnl_pips = (current_price - entry_price) * 10000  # For major pairs
+            else:
+                pnl_pips = (entry_price - current_price) * 10000
+            
+            # Enhanced exit conditions
+            if position['type'] == 'buy':
+                # 1. Strong false breakout (price closes below entry with momentum)
+                if (current_price < entry_price * 0.997 and  # 0.3% below entry
+                    len(df) >= 3 and
+                    df['close'].iloc[-1] < df['close'].iloc[-2] < df['close'].iloc[-3]):  # Declining closes
                     return {
                         'exit': True,
-                        'reason': 'False breakout - price returned to consolidation',
+                        'reason': 'False breakout confirmed - declining momentum',
                         'exit_price': current_price
                     }
                 
-                # Check for target reached
-                if current_price > entry_price * 1.01:  # 1% profit
+                # 2. Target reached (improved)
+                if current_price > entry_price * 1.015:  # 1.5% profit target
                     return {
                         'exit': True,
                         'reason': 'Target reached',
                         'exit_price': current_price
                     }
+                
+                # 3. Trailing stop (if profit > 0.5%)
+                if current_price > entry_price * 1.005:  # 0.5% profit
+                    # Set trailing stop at 0.3% below highest price since entry
+                    recent_high = df['high'].tail(10).max()
+                    trailing_stop = recent_high * 0.997
+                    if current_price < trailing_stop:
+                        return {
+                            'exit': True,
+                            'reason': 'Trailing stop hit',
+                            'exit_price': current_price
+                        }
             
             elif position['type'] == 'sell':
-                # Check if price has returned above breakout level
-                entry_price = position['price_open']
-                if current_price > entry_price * 1.002:  # 0.2% above entry
+                # 1. Strong false breakout (price closes above entry with momentum)
+                if (current_price > entry_price * 1.003 and  # 0.3% above entry
+                    len(df) >= 3 and
+                    df['close'].iloc[-1] > df['close'].iloc[-2] > df['close'].iloc[-3]):  # Rising closes
                     return {
                         'exit': True,
-                        'reason': 'False breakout - price returned to consolidation',
+                        'reason': 'False breakout confirmed - rising momentum',
                         'exit_price': current_price
                     }
                 
-                # Check for target reached
-                if current_price < entry_price * 0.99:  # 1% profit
+                # 2. Target reached (improved)
+                if current_price < entry_price * 0.985:  # 1.5% profit target
                     return {
                         'exit': True,
                         'reason': 'Target reached',
                         'exit_price': current_price
                     }
+                
+                # 3. Trailing stop (if profit > 0.5%)
+                if current_price < entry_price * 0.995:  # 0.5% profit
+                    # Set trailing stop at 0.3% above lowest price since entry
+                    recent_low = df['low'].tail(10).min()
+                    trailing_stop = recent_low * 1.003
+                    if current_price > trailing_stop:
+                        return {
+                            'exit': True,
+                            'reason': 'Trailing stop hit',
+                            'exit_price': current_price
+                        }
             
             return {'exit': False}
             

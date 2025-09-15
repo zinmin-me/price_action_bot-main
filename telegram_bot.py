@@ -355,6 +355,10 @@ class TelegramBot:
             except Exception:
                 pass
 
+            # Automatically disable strategy monitoring for this chat
+            if hasattr(self.controller, '_strategy_monitors'):
+                self.controller._strategy_monitors.discard(chat_id)
+
             # Stop AutoTrainer if running
             try:
                 if self.auto_trainer:
@@ -463,6 +467,7 @@ class TelegramBot:
         except Exception as e:
             logger.exception("Error triggering analysis")
             await update.message.reply_text(f"❌ Failed to analyze now: {e}")
+
     async def _cmd_start_trade(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Enable auto trading, using this chat's MT5 session if available."""
         # Check user authorization first
@@ -477,9 +482,17 @@ class TelegramBot:
         try:
             # Enable trading only for this chat
             try:
-                if hasattr(self.controller, 'start_trading_for_chat'):
+                logger.info(f"Controller type: {type(self.controller)}")
+                logger.info(f"Controller has start_trading_for_chat: {hasattr(self.controller, 'start_trading_for_chat')}")
+                logger.info(f"Controller methods: {[m for m in dir(self.controller) if 'trading' in m.lower()]}")
+                
+                # Try to use per-user session mode first
+                try:
+                    logger.info(f"Attempting to use per-user session mode for chat {chat_id}")
                     self.controller.start_trading_for_chat(chat_id, session)
-                else:
+                    logger.info(f"Successfully used per-user session mode for chat {chat_id}")
+                except AttributeError:
+                    logger.info(f"Per-user session mode not available, using legacy global mode for chat {chat_id}")
                     # Legacy fallback: global
                     self.controller.set_mt5_connector(session)
                     self.controller.enable_trading()
@@ -487,14 +500,21 @@ class TelegramBot:
                 logger.exception("Error enabling trading for chat")
                 await update.message.reply_text(f"❌ Failed to enable trading: {e}")
                 return
+            
             # Subscribe this chat to telemetry
             try:
                 self.controller.subscribe_telemetry(chat_id)
             except Exception:
                 pass
+            
+            # Automatically enable strategy monitoring for this chat
+            if not hasattr(self.controller, '_strategy_monitors'):
+                self.controller._strategy_monitors = set()
+            self.controller._strategy_monitors.add(chat_id)
+            
             is_admin = self._is_user_admin(chat_id)
             await update.message.reply_text(
-                "✅ Auto trading enabled. Use 🧠 Analyze Now anytime to see the latest analysis.",
+                "✅ Auto trading enabled with strategy monitoring.....",
                 reply_markup=_build_main_reply_keyboard(is_admin=is_admin),
             )
 
@@ -503,7 +523,9 @@ class TelegramBot:
                 if AutoTrainer and hasattr(self.controller, 'ai_strategy') and self.controller.ai_strategy:
                     if self.auto_trainer is None:
                         self.auto_trainer = AutoTrainer(self.controller.ai_strategy, session)
-                    self.auto_trainer.start_auto_training()
+                    # Only start if not already running
+                    if not self.auto_trainer.is_running:
+                        self.auto_trainer.start_auto_training()
             except Exception:
                 logger.exception("Failed to start AutoTrainer after enabling trading")
         except Exception as e:
@@ -2047,7 +2069,7 @@ class TelegramBot:
     def notify(self, chat_id: int, text: str):
         try:
             if not self.application or not self._loop:
-                return
+                return None
             fut = asyncio.run_coroutine_threadsafe(
                 self.application.bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=True),
                 self._loop,
@@ -2055,18 +2077,57 @@ class TelegramBot:
             try:
                 # Allow more time for Telegram API under load
                 result = fut.result(timeout=15)
-                return result
+                return result.message_id if result else None
             except Exception as e:
                 # On timeout or cancellation, attempt to cancel and log at warning level
                 try:
                     fut.cancel()
                 except Exception:
                     pass
-                logger.warning(f"Telegram notify timed out/cancelled for chat {chat_id}: {e}")
                 return None
         except Exception:
             logger.exception("Failed to send Telegram notification")
             return None
+    
+    def update_message(self, chat_id: int, message_id: int, text: str):
+        """Update an existing message"""
+        try:
+            if not self.application or not self._loop:
+                logger.warning(f"Cannot update message - application or loop not available for chat {chat_id}")
+                return False
+            fut = asyncio.run_coroutine_threadsafe(
+                self.application.bot.edit_message_text(
+                    chat_id=chat_id, 
+                    message_id=message_id, 
+                    text=text, 
+                    disable_web_page_preview=True
+                ),
+                self._loop,
+            )
+            try:
+                result = fut.result(timeout=15)
+                success = result is not None
+                logger.debug(f"Message update result for chat {chat_id}, message_id {message_id}: {success}")
+                return success
+            except Exception as e:
+                # Treat "message is not modified" as a successful no-op
+                try:
+                    msg = str(e).lower()
+                except Exception:
+                    msg = ""
+                if "message is not modified" in msg or "not modified" in msg:
+                    logger.debug(f"Message not modified for chat {chat_id}, message_id {message_id}; skipping update")
+                    return True
+                logger.warning(f"Message update failed for chat {chat_id}, message_id {message_id}: {e}")
+                # On timeout or cancellation, attempt to cancel and log at warning level
+                try:
+                    fut.cancel()
+                except Exception:
+                    pass
+                return False
+        except Exception as e:
+            logger.error(f"Exception in update_message for chat {chat_id}, message_id {message_id}: {e}")
+            return False
 
     def edit_message(self, chat_id: int, message_id: int, text: str):
         """Edit an existing message"""

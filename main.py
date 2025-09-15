@@ -40,6 +40,7 @@ try:
     from strategies.support_resistance import SupportResistanceStrategy
     from strategies.breakout import BreakoutStrategy
     from strategies.reversal_patterns import ReversalPatternsStrategy
+    from strategies.ranging import RangingStrategy
     STRATEGIES_AVAILABLE = True
 except ImportError as e:
     logger.warning(f"Strategies not available: {e}")
@@ -48,6 +49,7 @@ except ImportError as e:
     SupportResistanceStrategy = None
     BreakoutStrategy = None
     ReversalPatternsStrategy = None
+    RangingStrategy = None
 
 # Try to import telegram bot with graceful fallback
 try:
@@ -252,18 +254,34 @@ class PriceActionTradingBot:
         self._user_sessions: Dict[int, dict] = {}
         self._init_progress: Dict[int, dict] = {}  # chat_id -> {message_id, start_time, countdown}
         
-        # Initialize strategies
-        self._initialize_strategies()
+        # Strategy monitoring subscribers
+        self._strategy_monitors: set = set()
+        # Last notification timestamp to prevent duplicates
+        self._last_notification_time = None
+        # Strategy progress tracking
+        self._strategy_progress_message_ids: Dict[int, int] = {}  # chat_id -> message_id
+        self._current_strategy_index = 0
+        self._strategy_names = []
+        self._progress_message_created: set = set()  # chats that already created progress msg this cycle
+        self._progress_lock = threading.Lock()
+        # Suppress duplicate auto-close notifications for positions we closed ourselves
+        self._recently_closed: Dict[int, Dict] = {}  # ticket -> {time: datetime, reason: str}
         
-        # Initialize AI strategy if available
+        # Initialize AI strategy first (highest priority for XAUUSD+)
         self.ai_strategy = None
         if AI_AVAILABLE and self.mt5:
             try:
                 self.ai_strategy = AIStrategy(self.mt5)
                 self.strategies.append(self.ai_strategy)
-                logger.info("AI Strategy initialized")
+                logger.info("AI Strategy initialized (Priority 1 for XAUUSD+)")
             except Exception as e:
                 logger.error(f"Failed to initialize AI strategy: {e}")
+        
+        # Initialize other strategies
+        self._initialize_strategies()
+        
+        # Initialize strategy names for progress tracking
+        self._initialize_strategy_names()
         
         # Trading statistics
         self.stats = {
@@ -282,29 +300,113 @@ class PriceActionTradingBot:
         # Track processed close logs to trigger training on new logs
         self._processed_close_logs: set = set()
         
+    def _initialize_strategy_names(self):
+        """Initialize strategy names for progress tracking"""
+        self._strategy_names = []
+        for strategy in self.strategies:
+            if hasattr(strategy, 'name'):
+                self._strategy_names.append(strategy.name)
+            else:
+                # Fallback to class name
+                class_name = strategy.__class__.__name__
+                if class_name == 'AIStrategy':
+                    self._strategy_names.append('AI Strategy')
+                elif class_name == 'SupportResistanceStrategy':
+                    self._strategy_names.append('Support and Resistance')
+                elif class_name == 'TrendFollowingStrategy':
+                    self._strategy_names.append('Trend Following')
+                elif class_name == 'ReversalPatternsStrategy':
+                    self._strategy_names.append('Reversal Patterns')
+                elif class_name == 'BreakoutStrategy':
+                    self._strategy_names.append('Breakout')
+                elif class_name == 'RangingStrategy':
+                    self._strategy_names.append('Ranging')
+                else:
+                    self._strategy_names.append(class_name)
+        
+        logger.info(f"Strategy names initialized: {self._strategy_names}")
+
+    def _order_strategies_by_regime(self, strategies: List, df):
+        """Return strategies ordered by current market regime (ranging vs trending).
+
+        Uses ATR/price vs env threshold RANGING_MIN_ATR_RATIO to decide regime.
+        Ranging order: AI -> Ranging -> S&R -> Trend -> Breakout -> Reversal
+        Trending order: AI -> Trend -> S&R -> Breakout -> Reversal -> Ranging
+        """
+        try:
+            price = float(df['close'].iloc[-1])
+            from utils import TechnicalIndicators
+            atr_period = int(os.getenv('RANGING_ATR_PERIOD', '14'))
+            atr_series = TechnicalIndicators.atr(df['high'], df['low'], df['close'], atr_period)
+            atr = float(atr_series.iloc[-1]) if atr_series is not None else None
+            thresh = float(os.getenv('RANGING_MIN_ATR_RATIO', '0.0015'))
+            is_ranging = atr is not None and (atr / max(price, 1e-6)) <= thresh
+        except Exception:
+            is_ranging = False
+
+        # map
+        def key_of(s):
+            return s.__class__.__name__
+
+        s_map = {key_of(s): s for s in strategies}
+
+        if is_ranging:
+            order = ['AIStrategy', 'RangingStrategy', 'SupportResistanceStrategy', 'TrendFollowingStrategy', 'BreakoutStrategy', 'ReversalPatternsStrategy']
+            regime = 'ranging'
+        else:
+            order = ['AIStrategy', 'TrendFollowingStrategy', 'SupportResistanceStrategy', 'BreakoutStrategy', 'ReversalPatternsStrategy', 'RangingStrategy']
+            regime = 'trending'
+
+        ordered = [s_map[name] for name in order if name in s_map]
+        # Append any unknown strategies at the end
+        for s in strategies:
+            if s not in ordered:
+                ordered.append(s)
+        return ordered, regime
+        
     def _initialize_strategies(self):
-        """Initialize all trading strategies"""
+        """Initialize all trading strategies in optimized order for XAUUSD+"""
         if not MT5_AVAILABLE or self.mt5 is None or not STRATEGIES_AVAILABLE:
             logger.warning("Cannot initialize strategies - MT5 or strategies not available")
             return
         
-        if TREND_FOLLOWING_ENABLED and TrendFollowingStrategy:
-            self.strategies.append(TrendFollowingStrategy(self.mt5))
-            logger.info("Trend Following strategy initialized")
+        # Strategy initialization order optimized for XAUUSD+ (Gold) trading:
+        # 1. AI Strategy (highest priority - learns from profitable XAUUSD+ trades)
+        # Note: AI Strategy is added separately in __init__ after this method
         
+        # 2. Support & Resistance (most reliable for gold - bounces off key levels)
         if SUPPORT_RESISTANCE_ENABLED and SupportResistanceStrategy:
             self.strategies.append(SupportResistanceStrategy(self.mt5))
-            logger.info("Support & Resistance strategy initialized")
+            logger.info("Support & Resistance strategy initialized (Priority 2 for XAUUSD+)")
         
+        # 3. Trend Following (gold trends well and respects moving averages)
+        if TREND_FOLLOWING_ENABLED and TrendFollowingStrategy:
+            self.strategies.append(TrendFollowingStrategy(self.mt5))
+            logger.info("Trend Following strategy initialized (Priority 3 for XAUUSD+)")
+        
+        # 4. Breakout (less reliable for gold, but can catch major moves)
         if BREAKOUT_ENABLED and BreakoutStrategy:
             self.strategies.append(BreakoutStrategy(self.mt5))
-            logger.info("Breakout strategy initialized")
+            logger.info("Breakout strategy initialized (Priority 4 for XAUUSD+)")
         
+        # 5. Reversal Patterns (least reliable for gold, but can catch tops/bottoms)
         if REVERSAL_PATTERNS_ENABLED and ReversalPatternsStrategy:
             self.strategies.append(ReversalPatternsStrategy(self.mt5))
-            logger.info("Reversal Patterns strategy initialized")
+            logger.info("Reversal Patterns strategy initialized (Priority 5 for XAUUSD+)")
         
-        logger.info(f"Initialized {len(self.strategies)} trading strategies")
+        # 6. Ranging (mean-reversion when volatility is subdued)
+        try:
+            ranging_enabled = os.getenv('RANGING_ENABLED', 'true').lower() == 'true'
+        except Exception:
+            ranging_enabled = True
+        if ranging_enabled and 'RangingStrategy' in globals() and RangingStrategy:
+            try:
+                self.strategies.append(RangingStrategy(self.mt5))
+                logger.info("Ranging strategy initialized (Priority 6 for XAUUSD+)")
+            except Exception:
+                logger.exception("Failed to initialize Ranging strategy")
+        
+        logger.info(f"Initialized {len(self.strategies)} trading strategies in XAUUSD+ optimized order")
     
     def start(self):
         """Start the trading bot"""
@@ -373,6 +475,9 @@ class PriceActionTradingBot:
     def trading_loop(self):
         """Main trading loop executed every minute. Iterates per active user session."""
         try:
+            # Notify monitoring subscribers that strategy checking is starting
+            self._notify_strategy_check_start()
+            
             # If no per-user sessions, fall back to legacy single-session behavior when enabled
             if not self._user_sessions:
                 if not self._should_trade():
@@ -389,6 +494,10 @@ class PriceActionTradingBot:
                     if connector is None:
                         continue
                     strategies = state.get('strategies') or []
+                    
+                    # Update last analysis time
+                    state['last_analysis_time'] = datetime.now()
+                    
                     # Run a trading pass for this user/session
                     self._trading_loop_for_connector(connector, strategies, state)
                 except Exception as e:
@@ -396,6 +505,9 @@ class PriceActionTradingBot:
 
         except Exception as e:
             logger.error(f"Error in trading loop: {e}")
+        finally:
+            # Notify monitoring subscribers that strategy checking is complete
+            self._notify_strategy_check_complete()
 
     def _check_for_auto_closed_positions(self, connector: 'MT5Connector', state_or_self):
         """Check for positions that were automatically closed by broker (SL/TP hits)"""
@@ -427,6 +539,27 @@ class PriceActionTradingBot:
             # Find positions that were closed automatically
             for ticket, prev_pos in previous_positions.items():
                 if ticket not in current_positions:
+                    # Skip if we just closed it ourselves recently (e.g., manual/strategy close)
+                    try:
+                        rc = self._recently_closed.get(ticket)
+                        if rc:
+                            # Consider recent within 2 minutes
+                            if (datetime.now() - rc.get('time')).total_seconds() < 120:
+                                logger.info(f"Suppressing auto-close notice for recently closed ticket #{ticket}")
+                                # Clean up entry
+                                try:
+                                    del self._recently_closed[ticket]
+                                except Exception:
+                                    pass
+                                continue
+                            else:
+                                # Cleanup stale entry
+                                try:
+                                    del self._recently_closed[ticket]
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
                     # Position was closed - determine if it was auto-closed
                     profit = prev_pos.get('profit', 0.0)
                     symbol = prev_pos.get('symbol', 'Unknown')
@@ -631,6 +764,16 @@ class PriceActionTradingBot:
                 strategies.append(SupportResistanceStrategy(connector))
             except Exception:
                 logger.exception("Failed to init SupportResistanceStrategy")
+            # Include Ranging strategy if enabled
+            try:
+                ranging_enabled = os.getenv('RANGING_ENABLED', 'true').lower() == 'true'
+            except Exception:
+                ranging_enabled = True
+            try:
+                if ranging_enabled and 'RangingStrategy' in globals() and RangingStrategy:
+                    strategies.append(RangingStrategy(connector))
+            except Exception:
+                logger.exception("Failed to init RangingStrategy")
             try:
                 strategies.append(BreakoutStrategy(connector))
             except Exception:
@@ -674,7 +817,9 @@ class PriceActionTradingBot:
 
     def start_trading_for_chat(self, chat_id: int, connector: 'MT5Connector'):
         """Enable trading for a specific Telegram chat using its connector."""
+        logger.info(f"Starting trading for chat {chat_id}")
         if chat_id not in self._user_sessions:
+            logger.info(f"Creating new session for chat {chat_id}")
             self._user_sessions[chat_id] = {
                 'connector': connector,
                 'strategies': self._build_strategies_for_connector(connector, chat_id),
@@ -694,6 +839,7 @@ class PriceActionTradingBot:
             # Initialize previous positions tracking for this session
             self._previous_positions[chat_id] = {}
         else:
+            logger.info(f"Updating existing session for chat {chat_id}")
             state = self._user_sessions[chat_id]
             state['connector'] = connector
             if not state.get('strategies'):
@@ -702,7 +848,7 @@ class PriceActionTradingBot:
             # Reset cooldown timers when restarting trading
             state['last_trade_time'] = None
             state['last_loss_time'] = None
-        logger.info(f"Enabled trading for chat {chat_id}")
+        logger.info(f"Successfully enabled trading for chat {chat_id}")
 
     def stop_trading_for_chat(self, chat_id: int):
         """Disable trading for a specific Telegram chat."""
@@ -832,10 +978,41 @@ class PriceActionTradingBot:
                 except Exception:
                     logger.exception("Failed managing existing positions for symbol")
 
+                # Reorder strategies dynamically by regime (ATR/price)
+                try:
+                    ordered, regime = self._order_strategies_by_regime(strategies, df)
+                except Exception:
+                    ordered, regime = strategies, "unknown"
+
+                # Update progress list to reflect current order
+                try:
+                    self._strategy_names = []
+                    for s in ordered:
+                        name = getattr(s, 'name', None) or s.__class__.__name__
+                        if name == 'AIStrategy':
+                            self._strategy_names.append('AI Strategy')
+                        elif name == 'SupportResistanceStrategy':
+                            self._strategy_names.append('Support and Resistance')
+                        elif name == 'TrendFollowingStrategy':
+                            self._strategy_names.append('Trend Following')
+                        elif name == 'ReversalPatternsStrategy':
+                            self._strategy_names.append('Reversal Patterns')
+                        elif name == 'BreakoutStrategy':
+                            self._strategy_names.append('Breakout')
+                        elif name == 'RangingStrategy' or name == 'Ranging':
+                            self._strategy_names.append('Ranging')
+                        else:
+                            self._strategy_names.append(name)
+                except Exception:
+                    pass
+
                 analyses = []
                 # Analyze with each strategy
-                for strategy in strategies:
+                for strategy_index, strategy in enumerate(ordered):
                     try:
+                        # Update progress for this strategy
+                        self._update_strategy_progress(strategy_index)
+                        
                         analysis = strategy.analyze(df)
                         if analysis and analysis.get('signal') in ('buy', 'sell'):
                             # Enforce per-strategy minimum confidence (non-AI)
@@ -939,14 +1116,7 @@ class PriceActionTradingBot:
                             return a.get('confidence', 0) or 0
                         best_analysis, best_strategy = max(filtered, key=_confidence)
                         
-                        # Additional check: ensure no existing positions on this symbol
-                        try:
-                            current_positions = connector.get_positions(sym)
-                            if current_positions:
-                                logger.info(f"Skipping trade - {len(current_positions)} existing position(s) on {sym}")
-                                continue
-                        except Exception as e:
-                            logger.warning(f"Error checking positions for {sym}: {e}")
+                        # Allow multiple positions on same symbol; rely on global MAX_OPEN_POSITIONS only
                         
                         # Check maximum open positions limit across all symbols
                         try:
@@ -1065,6 +1235,20 @@ class PriceActionTradingBot:
                     )
                     # Send to all telemetry subscribers
                     self._notify_subscribers(msg)
+
+                    # Start a fresh strategy progress message for the originating chat
+                    try:
+                        chat_id = None
+                        if isinstance(state_or_self, dict):
+                            # Find chat_id for this connector
+                            for cid, session_state in self._user_sessions.items():
+                                if session_state.get('connector') is connector:
+                                    chat_id = cid
+                                    break
+                        if chat_id is not None and hasattr(self, '_start_new_progress_for_chat'):
+                            self._start_new_progress_for_chat(chat_id)
+                    except Exception:
+                        logger.exception("Failed to start new progress after trade execution")
         except Exception as e:
             logger.error(f"Error executing trade: {e}")
     
@@ -1201,6 +1385,14 @@ class PriceActionTradingBot:
                     
                     # Close position with reason
                     if active_mt5.close_position(position['ticket'], close_reason):
+                        # Mark as recently closed by us (suppress auto-close duplicate)
+                        try:
+                            self._recently_closed[position['ticket']] = {
+                                'time': datetime.now(),
+                                'reason': close_reason
+                            }
+                        except Exception:
+                            pass
                         profit = position['profit']
                         
                         # Update global stats
@@ -1577,6 +1769,186 @@ class PriceActionTradingBot:
             logger.info(f"Win rate: {win_rate:.1f}%")
         
         logger.info("Trading bot stopped")
+    
+    def _notify_strategy_check_start(self):
+        """Mark start of strategy checking; creation of message deferred to first update."""
+        if not self._strategy_monitors or not self.telegram_bot:
+            return
+        try:
+            from datetime import datetime
+            now = datetime.now()
+            # Prevent duplicate notifications within the same minute
+            if (self._last_notification_time and 
+                now.replace(second=0, microsecond=0) == self._last_notification_time.replace(second=0, microsecond=0)):
+                logger.debug(f"Skipping duplicate notification at {now.strftime('%H:%M:%S')}")
+                return
+            with self._progress_lock:
+                # Reset progress state; reuse previous message ids across cycles
+                self._current_strategy_index = 0
+                self._progress_message_created = set()
+                self._last_notification_time = now
+
+                # Proactively update existing messages to the new cycle state (do not create new here)
+                try:
+                    if self._strategy_progress_message_ids:
+                        progress_message = self._build_strategy_progress_message(now)
+                        for chat_id, msg_id in list(self._strategy_progress_message_ids.items()):
+                            self.telegram_bot.update_message(chat_id, msg_id, progress_message)
+                except Exception:
+                    logger.exception("Failed to update existing progress messages at cycle start")
+        except Exception as e:
+            logger.error(f"Error notifying strategy check start: {e}")
+    
+    def _build_strategy_progress_message(self, now):
+        """Build the strategy progress message"""
+        from datetime import datetime
+        
+        lines = [f"🔍 **Strategy Check Progress**\n"]
+        lines.append(f"Time: {now.strftime('%H:%M:%S')}\n")
+        
+        for i, strategy_name in enumerate(self._strategy_names):
+            if i < self._current_strategy_index:
+                status = "✅ completed"
+            elif i == self._current_strategy_index:
+                status = "🔄 checking"
+            else:
+                status = "⏳ pending"
+            
+            lines.append(f"{strategy_name} is {status}")
+        
+        return "\n".join(lines)
+    
+    def _update_strategy_progress(self, strategy_index):
+        """Update the strategy progress; create message on first update if needed."""
+        if not self._strategy_monitors or not self.telegram_bot:
+            return
+        
+        try:
+            from datetime import datetime
+            now = datetime.now()
+            
+            # Update current strategy index
+            self._current_strategy_index = strategy_index
+            
+            # Build updated progress message
+            progress_message = self._build_strategy_progress_message(now)
+            
+            # Update or create progress message for each subscriber (thread-safe, at most one create)
+            with self._progress_lock:
+                for chat_id in self._strategy_monitors:
+                    message_id = self._strategy_progress_message_ids.get(chat_id)
+                    if message_id:
+                        success = self.telegram_bot.update_message(chat_id, message_id, progress_message)
+                        logger.info(f"Updated progress message for chat {chat_id}, message_id: {message_id}, success: {success}")
+                        if not success:
+                            logger.warning(f"Update failed for chat {chat_id}; not sending new message to avoid duplicates")
+                    else:
+                        # First update this cycle: create the message now only if not already created
+                        if chat_id not in self._progress_message_created:
+                            new_id = self.telegram_bot.notify(chat_id, progress_message)
+                            logger.info(f"Created initial progress message for chat {chat_id}, message_id: {new_id}")
+                            if new_id:
+                                self._strategy_progress_message_ids[chat_id] = new_id
+                                self._progress_message_created.add(chat_id)
+                            else:
+                                # Mark as created to avoid repeated sends if Telegram returns no id
+                                self._progress_message_created.add(chat_id)
+        except Exception as e:
+            logger.error(f"Error updating strategy progress: {e}")
+    
+    def _notify_strategy_check_complete(self):
+        """Notify subscribers that strategy checking is complete"""
+        if not self._strategy_monitors or not self.telegram_bot:
+            return
+        
+        try:
+            from datetime import datetime
+            now = datetime.now()
+            
+            # Mark all strategies as completed
+            self._current_strategy_index = len(self._strategy_names)
+            
+            # Build final progress message
+            progress_message = self._build_strategy_progress_message(now)
+            
+            # Add completion info
+            active_sessions = sum(1 for state in self._user_sessions.values() if state.get('trading_enabled'))
+            next_check_time = now.replace(second=0, microsecond=0).replace(minute=now.minute+1).strftime('%H:%M')
+            
+            final_message = f"{progress_message}\n\n✅ **All strategies completed**\nActive Sessions: {active_sessions}\nNext Check: {next_check_time}"
+            
+            logger.info(f"Updating strategy check complete notification for {len(self._strategy_monitors)} subscribers")
+            for chat_id in self._strategy_monitors:
+                message_id = self._strategy_progress_message_ids.get(chat_id)
+                if message_id:
+                    success = self.telegram_bot.update_message(chat_id, message_id, final_message)
+                    logger.info(f"Updated completion message for chat {chat_id}, message_id: {message_id}, success: {success}")
+                    # Do not send a new message on failure to avoid duplicates
+                else:
+                    # Never create a new message at completion; avoid duplicates entirely
+                    logger.info(f"No progress message existed for chat {chat_id} during this cycle; skipping completion send")
+        except Exception as e:
+            logger.error(f"Error notifying strategy check complete: {e}")
+    
+    def _notify_signal_found(self, chat_id: int, signal_info: dict):
+        """Notify when a new trading signal is found"""
+        if chat_id not in self._strategy_monitors or not self.telegram_bot:
+            return
+        
+        try:
+            symbol = signal_info.get('symbol', 'Unknown')
+            signal = signal_info.get('signal', 'Unknown')
+            confidence = signal_info.get('confidence', 0)
+            strategy = signal_info.get('strategy', 'Unknown')
+            
+            message = f"🎯 **New Signal Found**\n\nSymbol: {symbol}\nSignal: {signal.upper()}\nConfidence: {confidence:.1f}%\nStrategy: {strategy}"
+            
+            self.telegram_bot.notify(chat_id, message)
+        except Exception as e:
+            logger.error(f"Error notifying signal found: {e}")
+    
+    def _notify_trade_executed(self, chat_id: int, trade_info: dict):
+        """Notify when a trade is executed"""
+        if chat_id not in self._strategy_monitors or not self.telegram_bot:
+            return
+        
+        try:
+            symbol = trade_info.get('symbol', 'Unknown')
+            order_type = trade_info.get('type', 'Unknown')
+            volume = trade_info.get('volume', 0)
+            price = trade_info.get('price', 0)
+            
+            message = f"📈 **Trade Executed**\n\nSymbol: {symbol}\nType: {order_type.upper()}\nVolume: {volume}\nPrice: {price:.5f}"
+            
+            self.telegram_bot.notify(chat_id, message)
+
+            # After a trade executes, start a fresh progress message for the next opportunity
+            try:
+                self._start_new_progress_for_chat(chat_id)
+            except Exception:
+                logger.exception("Failed to start new strategy progress after trade execution")
+        except Exception as e:
+            logger.error(f"Error notifying trade executed: {e}")
+
+    def _start_new_progress_for_chat(self, chat_id: int):
+        """Send a new progress message for a specific chat and set it as the active one."""
+        if not self.telegram_bot:
+            return
+        from datetime import datetime
+        now = datetime.now()
+        with self._progress_lock:
+            # Reset per-chat progress state so a new message is created
+            if not hasattr(self, '_progress_message_created'):
+                self._progress_message_created = set()
+            self._progress_message_created.discard(chat_id)  # allow creation
+            # Start from the beginning of strategies
+            self._current_strategy_index = 0
+            progress_message = self._build_strategy_progress_message(now)
+            new_id = self.telegram_bot.notify(chat_id, progress_message)
+            if new_id:
+                # Overwrite any prior message id so subsequent updates target the new message
+                self._strategy_progress_message_ids[chat_id] = new_id
+                self._progress_message_created.add(chat_id)
 
 def main():
     """Main entry point"""
