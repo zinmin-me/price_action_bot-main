@@ -617,6 +617,12 @@ class PriceActionTradingBot:
                             
                             self._notify_subscribers("\n".join(message_lines))
                             logger.info(f"Auto-closed position detected: #{ticket} {symbol} P/L: {profit:.2f} ({close_reason})")
+                            # After TP/SL notice, start a new strategy progress conversation per chat
+                            try:
+                                for cid in list(self._telemetry_chat_ids):
+                                    self._start_new_progress_for_chat(cid)
+                            except Exception:
+                                logger.exception("Failed to start new strategy progress after TP/SL")
                         except Exception:
                             logger.exception("Failed to notify auto-closed position")
             
@@ -1372,7 +1378,7 @@ class PriceActionTradingBot:
                 # Trailing stop management before exit checks
                 try:
                     if TRAILING_STOP_ENABLED and active_mt5 and df is not None and len(df) >= 20:
-                        self._apply_trailing_stop(position, df)
+                        self._apply_trailing_stop(position, df, active_mt5)
                 except Exception:
                     logger.exception("Trailing stop update failed")
 
@@ -1474,13 +1480,19 @@ class PriceActionTradingBot:
                                 ]
                                 
                                 self._notify_subscribers("\n".join(message_lines))
+                                # After TP/SL notice, start a new strategy progress conversation per chat
+                                try:
+                                    for cid in list(self._telemetry_chat_ids):
+                                        self._start_new_progress_for_chat(cid)
+                                except Exception:
+                                    logger.exception("Failed to start new strategy progress after TP/SL")
                             except Exception:
                                 logger.exception("Failed to notify position close")
                 
             except Exception as e:
                 logger.error(f"Error managing position {position['ticket']}: {e}")
 
-    def _apply_trailing_stop(self, position: Dict, df: 'pd.DataFrame'):
+    def _apply_trailing_stop(self, position: Dict, df: 'pd.DataFrame', connector: 'MT5Connector'):
         """Compute and update trailing stop for a single position."""
         symbol = position['symbol']
         ticket = position['ticket']
@@ -1500,7 +1512,7 @@ class PriceActionTradingBot:
             # points-based
             point = 0.0
             try:
-                point = self.mt5.symbol_info.point if getattr(self.mt5, 'symbol_info', None) else 0.0
+                point = connector.symbol_info.point if getattr(connector, 'symbol_info', None) else 0.0
             except Exception:
                 point = 0.0
             if not point:
@@ -1521,7 +1533,12 @@ class PriceActionTradingBot:
                 if BREEAKVEN_ENABLED := BREAKEVEN_ENABLED:
                     r = (price_open - sl) if sl else trail_dist
                     if r and (current_price - price_open) >= (BREAKEVEN_TRIGGER_R_MULT * r):
-                        be_price = price_open + (BREAKEVEN_OFFSET_POINTS * (self.mt5.symbol_info.point if getattr(self.mt5, 'symbol_info', None) else 0.0))
+                        be_point = 0.0
+                        try:
+                            be_point = connector.symbol_info.point if getattr(connector, 'symbol_info', None) else 0.0
+                        except Exception:
+                            be_point = 0.0
+                        be_price = price_open + (BREAKEVEN_OFFSET_POINTS * be_point)
                         if new_sl is None or be_price > new_sl:
                             new_sl = be_price
             except Exception:
@@ -1536,7 +1553,12 @@ class PriceActionTradingBot:
                 if BREEAKVEN_ENABLED := BREAKEVEN_ENABLED:
                     r = (sl - price_open) if sl else trail_dist
                     if r and (price_open - current_price) >= (BREAKEVEN_TRIGGER_R_MULT * r):
-                        be_price = price_open - (BREAKEVEN_OFFSET_POINTS * (self.mt5.symbol_info.point if getattr(self.mt5, 'symbol_info', None) else 0.0))
+                        be_point = 0.0
+                        try:
+                            be_point = connector.symbol_info.point if getattr(connector, 'symbol_info', None) else 0.0
+                        except Exception:
+                            be_point = 0.0
+                        be_price = price_open - (BREAKEVEN_OFFSET_POINTS * be_point)
                         if new_sl is None or be_price < new_sl:
                             new_sl = be_price
             except Exception:
@@ -1553,15 +1575,15 @@ class PriceActionTradingBot:
                     init_r = sl - price_open
                 if init_r and init_r > 0:
                     if position['type'] == 'buy' and (current_price - price_open) >= PARTIAL_TP_TRIGGER_R_MULT * init_r:
-                        self.mt5.close_partial_position(ticket, PARTIAL_TP_CLOSE_FRACTION, reason="Partial TP trigger")
+                        connector.close_partial_position(ticket, PARTIAL_TP_CLOSE_FRACTION, reason="Partial TP trigger")
                     elif position['type'] == 'sell' and (price_open - current_price) >= PARTIAL_TP_TRIGGER_R_MULT * init_r:
-                        self.mt5.close_partial_position(ticket, PARTIAL_TP_CLOSE_FRACTION, reason="Partial TP trigger")
+                        connector.close_partial_position(ticket, PARTIAL_TP_CLOSE_FRACTION, reason="Partial TP trigger")
             except Exception:
                 logger.exception("Partial TP handling failed")
 
         if new_sl is not None:
             try:
-                ok = self.mt5.modify_position_sl_tp(ticket, new_sl, new_tp)
+                ok = connector.modify_position_sl_tp(ticket, new_sl, new_tp)
                 if ok:
                     logger.info(f"Trailing SL updated for {ticket}: {sl} -> {new_sl}")
             except Exception:
@@ -1572,10 +1594,10 @@ class PriceActionTradingBot:
             if os.getenv('SCALPER_FORCE_TRAIL_EXIT', 'True').lower() == 'true':
                 if position['type'] == 'buy' and sl:
                     if current_price <= sl:
-                        self.mt5.close_position(ticket, reason="Trailing stop breached (scalp)")
+                        connector.close_position(ticket, reason="Trailing stop breached (scalp)")
                 elif position['type'] == 'sell' and sl:
                     if current_price >= sl:
-                        self.mt5.close_position(ticket, reason="Trailing stop breached (scalp)")
+                        connector.close_position(ticket, reason="Trailing stop breached (scalp)")
         except Exception:
             logger.exception("Force trailing exit check failed")
     
@@ -1804,7 +1826,7 @@ class PriceActionTradingBot:
         from datetime import datetime
         
         lines = [f"🔍 **Strategy Check Progress**\n"]
-        lines.append(f"Time: {now.strftime('%H:%M:%S')}\n")
+        lines.append(f"Time: {now.strftime('%I:%M:%S %p')}\n")
         
         for i, strategy_name in enumerate(self._strategy_names):
             if i < self._current_strategy_index:
@@ -1873,7 +1895,7 @@ class PriceActionTradingBot:
             
             # Add completion info
             active_sessions = sum(1 for state in self._user_sessions.values() if state.get('trading_enabled'))
-            next_check_time = now.replace(second=0, microsecond=0).replace(minute=now.minute+1).strftime('%H:%M')
+            next_check_time = now.replace(second=0, microsecond=0).replace(minute=now.minute+1).strftime('%I:%M %p')
             
             final_message = f"{progress_message}\n\n✅ **All strategies completed**\nActive Sessions: {active_sessions}\nNext Check: {next_check_time}"
             
