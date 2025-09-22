@@ -16,6 +16,15 @@ class RangingStrategy:
     def __init__(self, mt5_connector):
         self.mt5 = mt5_connector
         self.name = "Ranging"
+        # Enable flag to align with controller checks
+        self.enabled = True
+        # Assign a unique magic number so positions can be attributed
+        try:
+            from config import MAGIC_RANGING
+            self.magic_number = MAGIC_RANGING
+        except Exception:
+            # Fallback if config import fails; use a sensible default distinct id
+            self.magic_number = 1005
         # Parameters (can be moved to config if needed)
         self.bb_period = int(os.getenv("RANGING_BB_PERIOD", "20"))
         self.bb_std = float(os.getenv("RANGING_BB_STD", "2.0"))

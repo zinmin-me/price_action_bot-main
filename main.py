@@ -543,9 +543,9 @@ class PriceActionTradingBot:
                     try:
                         rc = self._recently_closed.get(ticket)
                         if rc:
-                            # Consider recent within 2 minutes
-                            if (datetime.now() - rc.get('time')).total_seconds() < 120:
-                                logger.info(f"Suppressing auto-close notice for recently closed ticket #{ticket}")
+                            # Consider recent within 5 minutes to account for any timing issues
+                            if (datetime.now() - rc.get('time')).total_seconds() < 300:
+                                logger.info(f"Suppressing auto-close notice for recently closed ticket #{ticket} (closed by: {rc.get('reason', 'unknown')})")
                                 # Clean up entry
                                 try:
                                     del self._recently_closed[ticket]
@@ -558,6 +558,19 @@ class PriceActionTradingBot:
                                     del self._recently_closed[ticket]
                                 except Exception:
                                     pass
+                    except Exception:
+                        pass
+                    
+                    # Additional check: skip if this position was already processed in close_reasons
+                    try:
+                        already_processed = any(
+                            cr['ticket'] == ticket and 
+                            (datetime.now() - cr['timestamp']).total_seconds() < 300
+                            for cr in self.close_reasons
+                        )
+                        if already_processed:
+                            logger.info(f"Suppressing auto-close notice for already processed ticket #{ticket}")
+                            continue
                     except Exception:
                         pass
                     # Position was closed - determine if it was auto-closed
@@ -625,6 +638,20 @@ class PriceActionTradingBot:
                                 logger.exception("Failed to start new strategy progress after TP/SL")
                         except Exception:
                             logger.exception("Failed to notify auto-closed position")
+
+                    # Track close reason for broker auto-closed positions so /close_reasons shows TP/SL hits
+                    try:
+                        self.close_reasons.append({
+                            'ticket': ticket,
+                            'symbol': symbol,
+                            'type': pos_type,
+                            'profit': profit,
+                            'reason': close_reason,
+                            'timestamp': datetime.now(),
+                            'strategy': 'Auto-detected'
+                        })
+                    except Exception:
+                        logger.exception("Failed to record broker auto-closed reason")
             
             # Update previous positions for next check
             self._previous_positions[chat_id] = current_positions
@@ -1395,8 +1422,10 @@ class PriceActionTradingBot:
                         try:
                             self._recently_closed[position['ticket']] = {
                                 'time': datetime.now(),
-                                'reason': close_reason
+                                'reason': close_reason,
+                                'strategy': strategy.__class__.__name__
                             }
+                            logger.info(f"Marked position {position['ticket']} as recently closed by strategy: {strategy.__class__.__name__}")
                         except Exception:
                             pass
                         profit = position['profit']
@@ -1451,35 +1480,47 @@ class PriceActionTradingBot:
                         # Send notification if enabled
                         if TELEGRAM_ENABLED and self.telegram_bot:
                             try:
-                                # Create more descriptive messages for TP/SL hits
-                                if "profit target reached" in close_reason.lower() or "take profit" in close_reason.lower():
-                                    emoji = "🎯"
-                                    title = "Take Profit Hit!"
-                                elif "stop loss" in close_reason.lower() or "stop loss triggered" in close_reason.lower():
-                                    emoji = "🛑"
-                                    title = "Stop Loss Hit!"
+                                # Check if this position was already processed by auto-detection
+                                already_notified = any(
+                                    cr['ticket'] == position['ticket'] and 
+                                    (datetime.now() - cr['timestamp']).total_seconds() < 300
+                                    for cr in self.close_reasons
+                                )
+                                
+                                if not already_notified:
+                                    # Create more descriptive messages for TP/SL hits
+                                    if "profit target reached" in close_reason.lower() or "take profit" in close_reason.lower():
+                                        emoji = "🎯"
+                                        title = "Take Profit Hit!"
+                                    elif "stop loss" in close_reason.lower() or "stop loss triggered" in close_reason.lower():
+                                        emoji = "🛑"
+                                        title = "Stop Loss Hit!"
+                                    else:
+                                        emoji = "💰" if profit > 0 else "📉"
+                                        title = "Position Closed"
+                                    
+                                    # Build detailed notification message
+                                    symbol = position.get('symbol', 'Unknown')
+                                    volume = position.get('volume', 0)
+                                    position_type = position.get('type', '').upper()
+                                    
+                                    message_lines = [
+                                        f"{emoji} **{title}**",
+                                        f"",
+                                        f"**Ticket:** #{position['ticket']}",
+                                        f"**Symbol:** {symbol}",
+                                        f"**Type:** {position_type}",
+                                        f"**Volume:** {volume}",
+                                        f"**P/L:** {profit:.2f}",
+                                        f"**Reason:** {close_reason}",
+                                        f"**Strategy:** {strategy.__class__.__name__}"
+                                    ]
+                                    
+                                    self._notify_subscribers("\n".join(message_lines))
+                                    logger.info(f"Sent strategy notification for position {position['ticket']}")
                                 else:
-                                    emoji = "💰" if profit > 0 else "📉"
-                                    title = "Position Closed"
+                                    logger.info(f"Skipping strategy notification for position {position['ticket']} - already notified by auto-detection")
                                 
-                                # Build detailed notification message
-                                symbol = position.get('symbol', 'Unknown')
-                                volume = position.get('volume', 0)
-                                position_type = position.get('type', '').upper()
-                                
-                                message_lines = [
-                                    f"{emoji} **{title}**",
-                                    f"",
-                                    f"**Ticket:** #{position['ticket']}",
-                                    f"**Symbol:** {symbol}",
-                                    f"**Type:** {position_type}",
-                                    f"**Volume:** {volume}",
-                                    f"**P/L:** {profit:.2f}",
-                                    f"**Reason:** {close_reason}",
-                                    f"**Strategy:** {strategy.__class__.__name__}"
-                                ]
-                                
-                                self._notify_subscribers("\n".join(message_lines))
                                 # After TP/SL notice, start a new strategy progress conversation per chat
                                 try:
                                     for cid in list(self._telemetry_chat_ids):
@@ -1768,6 +1809,49 @@ class PriceActionTradingBot:
     def stop(self):
         """Stop the trading bot"""
         logger.info("Stopping trading bot...")
+        # First, close all positions from all user sessions
+        logger.info("Closing all open positions before shutdown...")
+        total_positions_closed = {'success': 0, 'failed': 0, 'total_profit': 0.0}
+        
+        try:
+            for chat_id, session_state in list(self._user_sessions.items()):
+                connector = session_state.get('connector')
+                if connector and connector.connected:
+                    try:
+                        logger.info(f"Closing all positions for chat {chat_id}...")
+                        result = connector.close_all_positions(reason="Bot shutdown - emergency close")
+                        
+                        # Aggregate results
+                        total_positions_closed['success'] += result.get('success', 0)
+                        total_positions_closed['failed'] += result.get('failed', 0)
+                        total_positions_closed['total_profit'] += result.get('total_profit', 0.0)
+                        
+                        if result.get('success', 0) > 0:
+                            logger.info(f"Closed {result['success']} positions for chat {chat_id}")
+                        
+                    except Exception:
+                        logger.exception(f"Failed to close positions for chat {chat_id}")
+        except Exception:
+            logger.exception("Error while closing positions")
+        
+        # Log position closure summary
+        if total_positions_closed['success'] > 0 or total_positions_closed['failed'] > 0:
+            logger.info(f"Position closure summary: {total_positions_closed['success']} closed, {total_positions_closed['failed']} failed, Total P/L: {total_positions_closed['total_profit']:.2f}")
+        else:
+            logger.info("No positions found to close")
+        
+        # Now gracefully disconnect all user sessions
+        try:
+            for chat_id, session_state in list(self._user_sessions.items()):
+                connector = session_state.get('connector')
+                if connector:
+                    try:
+                        connector.disconnect()
+                        logger.info(f"Disconnected MT5 session for chat {chat_id}")
+                    except Exception:
+                        logger.exception(f"Failed to disconnect MT5 session for chat {chat_id}")
+        except Exception:
+            logger.exception("Error while disconnecting user sessions")
         # Stop Telegram bot first
         try:
             if self.telegram_bot:
@@ -1775,10 +1859,32 @@ class PriceActionTradingBot:
                 logger.info("Telegram bot stopped")
         except Exception as e:
             logger.error(f"Error stopping Telegram bot: {e}")
-        
+        # Stop all dedicated terminals via terminal manager / auto manager
+        try:
+            try:
+                from terminal_manager import terminal_manager
+                results = terminal_manager.stop_all_terminals()
+                logger.info(f"Stopped terminals: {list(results.keys())}")
+            except Exception:
+                logger.debug("Terminal manager stop_all_terminals not available or failed")
+            try:
+                from auto_terminal_manager import auto_terminal_manager
+                auto_terminal_manager.cleanup()
+            except Exception:
+                logger.debug("Auto terminal manager cleanup not available or failed")
+        except Exception:
+            logger.exception("Error stopping dedicated terminals")
+
         # Disconnect from MT5
         if self.mt5:
             self.mt5.disconnect()
+        
+        # Force cleanup all MT5 connections and processes
+        try:
+            from mt5_connector import force_cleanup_all_mt5
+            force_cleanup_all_mt5()
+        except Exception as e:
+            logger.error(f"Error during force cleanup: {e}")
         
         # Log final statistics
         logger.info("=== Final Statistics ===")
@@ -1986,12 +2092,31 @@ def main():
     # Create and start bot
     bot = PriceActionTradingBot()
     
+    # Set up signal handlers for graceful shutdown
+    import signal
+    import sys
+    
+    def signal_handler(signum, frame):
+        print(f"\n🛑 Received signal {signum}. Shutting down gracefully...")
+        print("🔄 Closing all open positions from all MT5 accounts...")
+        print("🔄 Disconnecting from all MT5 accounts...")
+        print("🔄 Force closing all MT5 terminal processes...")
+        bot.stop()
+        sys.exit(0)
+    
+    # Register signal handlers
+    signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
+    signal.signal(signal.SIGTERM, signal_handler)  # Termination signal
+    
     try:
         bot.start()
     except KeyboardInterrupt:
-        print("\nBot stopped by user")
+        print("\n🛑 Bot stopped by user (Ctrl+C)")
+        print("🔄 Closing all open positions from all MT5 accounts...")
+        print("🔄 Disconnecting from all MT5 accounts...")
+        print("🔄 Force closing all MT5 terminal processes...")
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"❌ Error: {e}")
         logger.error(f"Fatal error: {e}")
     finally:
         bot.stop()

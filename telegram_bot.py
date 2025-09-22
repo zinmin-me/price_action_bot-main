@@ -7,7 +7,9 @@ orders, trading actions, performance, history, alerts, and news.
 import asyncio
 import threading
 import logging
+import time
 from typing import Optional, List, Dict
+from queue import Queue, Empty
 
 from config import (
     TELEGRAM_BOT_TOKEN,
@@ -47,7 +49,9 @@ from telegram.ext import (
     MessageHandler,
     filters,
     ContextTypes,
+    AIORateLimiter,
 )
+from telegram.error import RetryAfter, TelegramError
 
 logger = logging.getLogger(__name__)
 
@@ -60,8 +64,6 @@ def _build_main_reply_keyboard(news_count: int = 0, is_admin: bool = False) -> R
         ["🟢 Start Trade", "🔴 End Trade"],
         ["📈 Performance", "🧾 History"],
         ["⚠️ Close Reasons","🧠 Analyze Now"],
-        ["🤖 AI Status"],
-        ["🚀 AI Train", "📈 AI Performance"],
         [news_label],
     ]
     
@@ -70,7 +72,10 @@ def _build_main_reply_keyboard(news_count: int = 0, is_admin: bool = False) -> R
         keyboard_layout.extend([
             ["👑 Admin Panel"],
             ["➕ Add User", "📋 List Users"],
-            ["📊 DB Stats"]
+            ["🗑️ Delete User", "📊 DB Stats"],
+            ["🖥️ Terminals", "🔄 Sessions"],
+            ["🤖 AI Status"],
+            ["🚀 AI Train", "📈 AI Performance"],
         ])
     
     return ReplyKeyboardMarkup(
@@ -91,7 +96,8 @@ def _build_minimal_reply_keyboard(is_admin: bool = False) -> ReplyKeyboardMarkup
         keyboard_layout.extend([
             ["👑 Admin Panel"],
             ["➕ Add User", "📋 List Users"],
-            ["📊 DB Stats"]
+            ["🗑️ Delete User", "📊 DB Stats"],
+            ["🖥️ Terminals", "🔄 Sessions"]
         ])
     
     return ReplyKeyboardMarkup(
@@ -132,6 +138,119 @@ class TelegramBot:
         self._login_states: Dict[int, Dict[str, str]] = {}
         # Auto-trainer instance
         self.auto_trainer: Optional[AutoTrainer] = None
+        # Message queue for rate limiting
+        self._message_queue: Queue = Queue()
+        self._queue_worker_running = False
+        # Initialize terminal manager
+        self._init_terminal_manager()
+
+    def _init_terminal_manager(self):
+        """Initialize automatic terminal manager from database"""
+        try:
+            from auto_terminal_manager import auto_terminal_manager
+            
+            # Initialize auto terminal manager (loads from database)
+            if auto_terminal_manager.initialize():
+                logger.info("Auto Terminal Manager initialized successfully")
+            else:
+                logger.warning("Failed to initialize Auto Terminal Manager, using shared terminal mode")
+                
+        except ImportError:
+            logger.warning("Auto Terminal Manager not available, using shared terminal mode")
+        except Exception as e:
+            logger.error(f"Error initializing auto terminal manager: {e}")
+
+    def _start_queue_worker(self):
+        """Start the message queue worker thread"""
+        if not self._queue_worker_running:
+            self._queue_worker_running = True
+            worker_thread = threading.Thread(target=self._queue_worker, daemon=True)
+            worker_thread.start()
+            logger.info("Message queue worker started")
+
+    def _queue_worker(self):
+        """Worker thread that processes queued messages with rate limiting"""
+        while self._queue_worker_running:
+            try:
+                # Get message from queue with timeout
+                message_data = self._message_queue.get(timeout=1.0)
+                
+                if message_data is None:  # Shutdown signal
+                    break
+                    
+                chat_id, text, message_type = message_data
+                
+                if message_type == 'send':
+                    self._send_message_direct(chat_id, text)
+                elif message_type == 'update':
+                    message_id = message_data[3]
+                    self._update_message_direct(chat_id, message_id, text)
+                    
+                # Longer delay to ensure we don't overwhelm Telegram
+                time.sleep(0.5)  # Half second between messages
+                
+            except Empty:
+                continue
+            except Exception as e:
+                logger.error(f"Error in queue worker: {e}")
+
+    async def _error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Global error handler for rate limiting and other errors"""
+        try:
+            error = context.error
+            if isinstance(error, RetryAfter):
+                # Rate limit hit - log with descriptive message per user preference
+                logger.warning(f"Rate limit exceeded (retry in {error.retry_after} seconds)")
+                # Don't try to send a message as that would likely hit the same rate limit
+                return
+            elif isinstance(error, TelegramError):
+                # Other Telegram API errors - log descriptively
+                logger.warning(f"Telegram API error ({error.message})")
+                return
+            else:
+                # Other errors
+                logger.error(f"Unhandled error in telegram bot: {error}")
+        except Exception as e:
+            logger.error(f"Error in error handler: {e}")
+
+    async def safe_reply_text(self, update: Update, text: str, **kwargs):
+        """Rate-limited reply_text wrapper"""
+        try:
+            chat_id = update.effective_chat.id
+            # For simple text messages without special formatting, use queue
+            if not kwargs or (len(kwargs) == 1 and 'disable_web_page_preview' in kwargs):
+                self._message_queue.put((chat_id, text, 'send'), block=False)
+                return
+            # For messages with special parameters (reply_markup, parse_mode, etc.), use direct send with error handling
+            await self.safe_reply_text(update, text, **kwargs)
+        except RetryAfter as retry_error:
+            logger.warning(f"Rate limit exceeded (retry in {retry_error.retry_after} seconds)")
+        except TelegramError as tg_error:
+            logger.warning(f"Telegram API error ({tg_error.message})")
+        except Exception as e:
+            logger.warning(f"Failed to send reply for chat {update.effective_chat.id}: {e}")
+            # Try queuing as fallback for simple messages
+            if not kwargs:
+                try:
+                    self._message_queue.put((chat_id, text, 'send'), block=False)
+                except:
+                    pass
+
+    async def safe_send_message(self, chat_id: int, text: str, **kwargs):
+        """Rate-limited send_message wrapper"""
+        try:
+            # Queue the message instead of sending directly
+            self._message_queue.put((chat_id, text, 'send'), block=False)
+        except Exception as e:
+            logger.warning(f"Failed to queue message for chat {chat_id}: {e}")
+            # Fallback to direct send (will be handled by global error handler if rate limited)
+            try:
+                if self.application:
+                    await self.application.bot.send_message(chat_id=chat_id, text=text, **kwargs)
+            except RetryAfter as retry_error:
+                logger.warning(f"Rate limit exceeded (retry in {retry_error.retry_after} seconds)")
+            except TelegramError as tg_error:
+                logger.warning(f"Telegram API error ({tg_error.message})")
 
     def _get_session(self, chat_id: int) -> Optional[MT5Connector]:
         """Return per-chat MT5Connector if exists, else None (force login)."""
@@ -150,7 +269,7 @@ class TelegramBot:
         chat_id = update.effective_chat.id
         
         if not self._is_user_authorized(chat_id):
-            await update.message.reply_text(
+            await self.safe_reply_text(update, 
                 "❌ Access Denied\n\n"
                 "You are not authorized to use this bot. Please contact the administrator to get access."
             )
@@ -162,7 +281,7 @@ class TelegramBot:
         chat_id = update.effective_chat.id
         
         if not self._is_user_admin(chat_id):
-            await update.message.reply_text(
+            await self.safe_reply_text(update, 
                 "❌ Admin Access Required\n\n"
                 "This command is only available to administrators."
             )
@@ -181,7 +300,7 @@ class TelegramBot:
                 # Start interactive wizard
                 chat_id = update.effective_chat.id
                 self._login_states[chat_id] = {"stage": "account"}
-                await update.message.reply_text("Please enter your Account (login) number:")
+                await self.safe_reply_text(update, "Please enter your Account (login) number:")
                 return
             login = int(args[0])
             password = args[1]
@@ -190,36 +309,124 @@ class TelegramBot:
             # Check if user is already logged in with a different account
             existing_session = self._sessions.get(update.effective_chat.id)
             if existing_session and existing_session._login != login:
-                await update.message.reply_text(
+                await self.safe_reply_text(update, 
                     f"You are already logged in with account {existing_session._login}. "
                     f"Please logout first before switching to account {login}."
                 )
                 return
             
-            # Create and connect new session
-            session = MT5Connector(login=login, password=password, server=server,
-                                   terminal_path=None)
+            # Check if we have a dedicated terminal for this account or user
+            terminal_name = None
+            try:
+                from auto_terminal_manager import auto_terminal_manager
+                # First try to find terminal by account number
+                terminal_name = auto_terminal_manager.get_terminal_for_account(login)
+                logger.info(f"Terminal lookup by account {login}: {terminal_name}")
+                
+                # If not found by account, try to find by user ID
+                if not terminal_name:
+                    bot_user = db_manager.get_bot_user_by_telegram_chat_id(update.effective_chat.id)
+                    if bot_user:
+                        terminal_name = auto_terminal_manager.get_terminal_for_user(bot_user['bot_user_id'])
+                        logger.info(f"Terminal lookup by user ID {bot_user['bot_user_id']}: {terminal_name}")
+                        
+                        # Debug: Check what's in the database
+                        account = db_manager.get_mt_account_by_bot_user_id(bot_user['bot_user_id'])
+                        if account:
+                            logger.info(f"Database account for user {bot_user['bot_user_id']}: {account}")
+                        else:
+                            logger.info(f"No database account found for user {bot_user['bot_user_id']}")
+                
+                # If still not found, use the database terminal name as fallback
+                if not terminal_name:
+                    if bot_user:
+                        account = db_manager.get_mt_account_by_bot_user_id(bot_user['bot_user_id'])
+                        if account and account.get('terminal_name'):
+                            terminal_name = account['terminal_name']
+                            logger.info(f"Using database terminal name as fallback: {terminal_name}")
+                        else:
+                            # Generate expected terminal name as last resort
+                            expected_terminal_name = f"tmn_{update.effective_chat.id}"
+                            logger.info(f"No terminal found, expected terminal name: {expected_terminal_name}")
+                            terminal_name = expected_terminal_name
+            except ImportError:
+                logger.warning("Auto Terminal Manager not available")
+            except Exception as e:
+                logger.error(f"Error during terminal lookup: {e}")
+            
+            # Ensure terminal is configured and path is correct BEFORE creating connector
+            try:
+                bot_user = db_manager.get_bot_user_by_telegram_chat_id(update.effective_chat.id)
+                if bot_user:
+                    # Persist MT account and terminal name first
+                    db_manager.add_mt_account(
+                        bot_user['bot_user_id'],
+                        login,
+                        update.effective_chat.id
+                    )
+                    from auto_terminal_manager import auto_terminal_manager
+                    # Create or update terminal configuration
+                    auto_terminal_manager.create_terminal_for_user(
+                        bot_user['bot_user_id'],
+                        login
+                    )
+                    # If terminal already exists, ensure it uses the latest resolved MT5 path and login
+                    try:
+                        if terminal_name:
+                            from terminal_manager import terminal_manager
+                            if terminal_name in terminal_manager.terminals:
+                                cfg = terminal_manager.terminals[terminal_name]
+                                # Update path and login just in case
+                                new_path = auto_terminal_manager._get_mt5_path()
+                                if cfg.terminal_path != new_path or cfg.login != login:
+                                    cfg.terminal_path = new_path
+                                    cfg.login = login
+                                    logger.info(f"Updated terminal config for {terminal_name}: path={new_path}, login={login}")
+                    except Exception as e:
+                        logger.warning(f"Could not ensure terminal config for {terminal_name}: {e}")
+                    # Start terminal proactively when we know the name
+                    if terminal_name:
+                        try:
+                            auto_terminal_manager.terminal_manager.start_terminal(terminal_name)
+                            logger.info(f"Started terminal {terminal_name} prior to connection")
+                        except Exception as e:
+                            logger.warning(f"Could not start terminal {terminal_name}: {e}")
+            except Exception as e:
+                logger.warning(f"Pre-connection terminal setup failed: {e}")
+
+            # Create and connect new session using direct connection
+            await self.safe_reply_text(update, f"🔗 Connecting directly to MT5...")
+            session = MT5Connector(
+                    login=login, 
+                    password=password, 
+                    server=server,
+                direct_connection=True
+            )
+            logger.info(f"Created MT5Connector with direct_connection=True for account {login}")
+            
             if not session.connect():
                 # Provide specific MT5 error if available
                 try:
                     msg = session.get_last_error_message()
                 except Exception:
                     msg = "MT5 login failed. Check credentials/server."
-                await update.message.reply_text(f"❌ {msg}")
+                await self.safe_reply_text(update, f"❌ {msg}")
                 return
             
-            # Store session and update database
+            # Store session (DB already updated before connect)
             self._sessions[update.effective_chat.id] = session
             
-            # Get bot user info and store MT account in database
+            # Create/enable per-user trading session so performance and stats work
+            try:
+                self.controller.start_trading_for_chat(update.effective_chat.id, session)
+            except Exception as e:
+                logger.warning(f"Failed to start trading session for chat {update.effective_chat.id}: {e}")
+            
+            # Get bot user info for keyboard and message
             chat_id = update.effective_chat.id
-            bot_user = db_manager.get_bot_user_by_telegram_chat_id(chat_id)
-            if bot_user:
-                db_manager.add_mt_account(bot_user['bot_user_id'], login)
-                logger.info(f"Stored MT account {login} for bot_user_id {bot_user['bot_user_id']}")
             
             info = session.get_account_info() or {}
-            await update.message.reply_text(
+            await self.safe_reply_text(update, 
                 f"✅ Logged in to account: {info.get('login', login)}\n"
                 f"Balance: {info.get('balance', 0):.2f} {info.get('currency', '')}"
             )
@@ -227,19 +434,19 @@ class TelegramBot:
             try:
                 count = await self._get_upcoming_count()
                 is_admin = self._is_user_admin(chat_id)
-                await update.message.reply_text(
+                await self.safe_reply_text(update, 
                     "Keyboard updated.", reply_markup=_build_main_reply_keyboard(count, is_admin)
                 )
             except Exception:
                 pass
         except Exception as e:
-            await update.message.reply_text(f"Login error: {e}")
+            await self.safe_reply_text(update, f"Login error: {e}")
 
     async def _cmd_logout(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         session = self._sessions.get(chat_id)
         if not session:
-            await update.message.reply_text("No session to logout.")
+            await self.safe_reply_text(update, "No session to logout.")
             return
         
         account_login = session._login
@@ -260,14 +467,14 @@ class TelegramBot:
             logger.info(f"Removed MT account from database for bot_user_id {bot_user['bot_user_id']}")
         
         self._sessions.pop(chat_id, None)
-        await update.message.reply_text(f"✅ Logged out of MT5 account {account_login} for this chat.")
+        await self.safe_reply_text(update, f"✅ Logged out of MT5 account {account_login} for this chat.")
 
     async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Check user authorization first
         if not await self._check_user_authorization(update, context):
             return
             
-        await update.message.reply_text(
+        await self.safe_reply_text(update, 
             "Welcome to Price Action Bot. Use the buttons or commands.",
             reply_markup=_build_show_hide_inline(),
         )
@@ -282,11 +489,11 @@ class TelegramBot:
         session = self._get_session(chat_id)
         
         if not session:
-            await update.message.reply_text("Please /login first to stop trading.")
+            await self.safe_reply_text(update, "Please /login first to stop trading.")
             return
         
         # Send initial message
-        await update.message.reply_text("🛑 Stopping trade and closing all positions...")
+        await self.safe_reply_text(update, f"🛑 Stopping trade and closing all positions...")
         
         try:
             # Disable only this chat's trading and close positions
@@ -304,7 +511,7 @@ class TelegramBot:
             try:
                 cancel_res = session.cancel_all_orders()
                 if cancel_res.get('total', 0) > 0:
-                    await update.message.reply_text(
+                    await self.safe_reply_text(update, 
                         f"⛔ Cancelled pending orders: {cancel_res.get('success', 0)}/{cancel_res.get('total', 0)}"
                     )
             except Exception:
@@ -347,7 +554,7 @@ class TelegramBot:
             
             # Send summary
             summary_text = "\n".join(summary_lines)
-            await update.message.reply_text(summary_text, parse_mode='Markdown')
+            await self.safe_reply_text(update, summary_text, parse_mode='Markdown')
             
             # Keep bot running; only trading is disabled
             try:
@@ -368,10 +575,10 @@ class TelegramBot:
             
         except Exception as e:
             logger.exception("Error during stop trade")
-            await update.message.reply_text(f"❌ Error stopping trade: {e}")
+            await self.safe_reply_text(update, f"❌ Error stopping trade: {e}")
         
         # Show keyboard options
-        await update.message.reply_text("Use ▶️ Start Trade to enable trading again.", reply_markup=_build_show_hide_inline())
+        await self.safe_reply_text(update, "Use ▶️ Start Trade to enable trading again.", reply_markup=_build_show_hide_inline())
 
     async def _cmd_close_all(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Close all positions without stopping the bot"""
@@ -379,11 +586,11 @@ class TelegramBot:
         session = self._get_session(chat_id)
         
         if not session:
-            await update.message.reply_text("Please /login first.")
+            await self.safe_reply_text(update, "Please /login first.")
             return
         
         # Send initial message
-        await update.message.reply_text("🔄 Closing all positions...")
+        await self.safe_reply_text(update, f"🔄 Closing all positions...")
         
         try:
             # Close all positions and update statistics
@@ -414,11 +621,11 @@ class TelegramBot:
             
             # Send summary
             summary_text = "\n".join(summary_lines)
-            await update.message.reply_text(summary_text, parse_mode='Markdown')
+            await self.safe_reply_text(update, summary_text, parse_mode='Markdown')
             
         except Exception as e:
             logger.exception("Error during close all positions")
-            await update.message.reply_text(f"❌ Error closing positions: {e}")
+            await self.safe_reply_text(update, f"❌ Error closing positions: {e}")
 
     async def _cmd_analyze_now(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Force an immediate analysis pass and send snapshot to Telegram."""
@@ -427,17 +634,17 @@ class TelegramBot:
             chat_id = update.effective_chat.id
             session = self._get_session(chat_id)
             if not session:
-                await update.message.reply_text("Please /login first.")
+                await self.safe_reply_text(update, "Please /login first.")
                 return
             # Reconnect if the session is not currently connected
             try:
                 if not getattr(session, 'connected', False):
                     ok = session.connect()
                     if not ok:
-                        await update.message.reply_text("❌ Could not connect to MT5. Please /login again.")
+                        await self.safe_reply_text(update, f"❌ Could not connect to MT5. Please /login again.")
                         return
             except Exception:
-                await update.message.reply_text("❌ MT5 connection error. Please /login again.")
+                await self.safe_reply_text(update, f"❌ MT5 connection error. Please /login again.")
                 return
             # Attach the session to the controller temporarily
             try:
@@ -461,12 +668,12 @@ class TelegramBot:
                         snap = f"{snap}\n" + "\n".join(lines)
                 except Exception:
                     pass
-                await update.message.reply_text(snap)
+                await self.safe_reply_text(update, snap)
             else:
-                await update.message.reply_text("No snapshot available (no data or error).")
+                await self.safe_reply_text(update, "No snapshot available (no data or error).")
         except Exception as e:
             logger.exception("Error triggering analysis")
-            await update.message.reply_text(f"❌ Failed to analyze now: {e}")
+            await self.safe_reply_text(update, f"❌ Failed to analyze now: {e}")
 
     async def _cmd_start_trade(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Enable auto trading, using this chat's MT5 session if available."""
@@ -477,7 +684,7 @@ class TelegramBot:
         chat_id = update.effective_chat.id
         session = self._get_session(chat_id)
         if not session:
-            await update.message.reply_text("Please /login first with 🔑 Login or /login.")
+            await self.safe_reply_text(update, "Please /login first with 🔑 Login or /login.")
             return
         try:
             # Enable trading only for this chat
@@ -498,7 +705,7 @@ class TelegramBot:
                     self.controller.enable_trading()
             except Exception as e:
                 logger.exception("Error enabling trading for chat")
-                await update.message.reply_text(f"❌ Failed to enable trading: {e}")
+                await self.safe_reply_text(update, f"❌ Failed to enable trading: {e}")
                 return
             
             # Subscribe this chat to telemetry
@@ -513,7 +720,7 @@ class TelegramBot:
             self.controller._strategy_monitors.add(chat_id)
             
             is_admin = self._is_user_admin(chat_id)
-            await update.message.reply_text(
+            await self.safe_reply_text(update, 
                 "✅ Auto trading enabled with strategy monitoring.....",
                 reply_markup=_build_main_reply_keyboard(is_admin=is_admin),
             )
@@ -530,13 +737,13 @@ class TelegramBot:
                 logger.exception("Failed to start AutoTrainer after enabling trading")
         except Exception as e:
             logger.exception("Error enabling trading")
-            await update.message.reply_text(f"❌ Failed to enable trading: {e}")
+            await self.safe_reply_text(update, f"❌ Failed to enable trading: {e}")
 
     async def _cmd_restart(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         self.controller.stop()
         await asyncio.sleep(0.5)
         self.controller.start()
-        await update.message.reply_text("Bot restarted.")
+        await self.safe_reply_text(update, "Bot restarted.")
 
     async def _on_inline_toggle(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -564,10 +771,10 @@ class TelegramBot:
             kb = _build_main_reply_keyboard(count, is_admin)
         else:
             kb = _build_minimal_reply_keyboard(is_admin)
-        await update.message.reply_text("Keyboard shown.", reply_markup=kb)
+        await self.safe_reply_text(update, "Keyboard shown.", reply_markup=kb)
 
     async def _cmd_close(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(
+        await self.safe_reply_text(update, 
             "Keyboard hidden.", reply_markup=ReplyKeyboardRemove()
         )
 
@@ -581,8 +788,9 @@ class TelegramBot:
             imp_map = {"low": "1", "medium": "2", "high": "3"}
             imp_param = imp_map.get(importance, None)
 
-            d1 = (datetime.utcnow() - timedelta(days=2)).strftime('%Y-%m-%d')
-            d2 = (datetime.utcnow() + timedelta(days=7)).strftime('%Y-%m-%d')
+            from datetime import datetime as _dt, timedelta as _td
+            d1 = (_dt.utcnow() - _td(days=2)).strftime('%Y-%m-%d')
+            d2 = (_dt.utcnow() + _td(days=7)).strftime('%Y-%m-%d')
             base = "https://api.tradingeconomics.com/calendar/country/"
             url = (
                 f"{base}{requests.utils.quote(country)}?c={requests.utils.quote(TE_API_CLIENT)}&format=json"
@@ -596,10 +804,10 @@ class TelegramBot:
             data = resp.json() or []
             def parse_iso(dt_str: str):
                 try:
-                    return datetime.fromisoformat(dt_str.replace('Z', ''))
+                    return _dt.fromisoformat(dt_str.replace('Z', ''))
                 except Exception:
                     return None
-            now = datetime.utcnow()
+            now = _dt.utcnow()
             return sum(1 for e in data if (parse_iso(e.get('Date') or e.get('DateUtc') or '') or now) >= now)
         except Exception:
             return 0
@@ -607,11 +815,11 @@ class TelegramBot:
     async def _cmd_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         session = self._get_session(update.effective_chat.id)
         if not session:
-            await update.message.reply_text("Please /login first.")
+            await self.safe_reply_text(update, "Please /login first.")
             return
         info = session.get_account_info()
         if not info:
-            await update.message.reply_text("Unable to fetch account info.")
+            await self.safe_reply_text(update, "Unable to fetch account info.")
             return
         msg = (
             f"Balance: {info['balance']:.2f}\n"
@@ -619,16 +827,16 @@ class TelegramBot:
             f"Margin: {info['margin']:.2f}\n"
             f"Free Margin: {info['free_margin']:.2f}"
         )
-        await update.message.reply_text(msg)
+        await self.safe_reply_text(update, msg)
 
     async def _cmd_account(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         session = self._get_session(update.effective_chat.id)
         if not session:
-            await update.message.reply_text("Please /login first.")
+            await self.safe_reply_text(update, "Please /login first.")
             return
         info = session.get_account_info()
         if not info:
-            await update.message.reply_text("Unable to fetch account info.")
+            await self.safe_reply_text(update, "Unable to fetch account info.")
             return
         # Detect account type heuristically using server/company/name
         broker_meta = (info.get('server') or '') + ' ' + (info.get('company') or '') + ' ' + (info.get('name') or '')
@@ -685,16 +893,16 @@ class TelegramBot:
             "----------------------------\n"
             f"Detected: {symbol_variant}"
         )
-        await update.message.reply_text(msg + msg2)
+        await self.safe_reply_text(update, msg + msg2)
 
     async def _cmd_info(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         session = self._get_session(update.effective_chat.id)
         if not session:
-            await update.message.reply_text("Please /login first.")
+            await self.safe_reply_text(update, "Please /login first.")
             return
         info = session.get_account_info()
         if not info:
-            await update.message.reply_text("Unable to fetch account info.")
+            await self.safe_reply_text(update, "Unable to fetch account info.")
             return
         # Determine bot running state (based on MT5 connection and schedule loop being active)
         is_running = getattr(self.controller.mt5, 'connected', False)
@@ -726,48 +934,48 @@ class TelegramBot:
             f"Equity: {info['equity']:.2f}\n"
             f"Free Margin: {info['free_margin']:.2f}"
         )
-        await update.message.reply_text(msg)
+        await self.safe_reply_text(update, msg)
 
     async def _cmd_positions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         session = self._get_session(update.effective_chat.id)
         if not session:
-            await update.message.reply_text("Please /login first.")
+            await self.safe_reply_text(update, "Please /login first.")
             return
         positions = session.get_positions()
         if not positions:
-            await update.message.reply_text("No open positions.")
+            await self.safe_reply_text(update, "No open positions.")
             return
         lines: List[str] = []
         for p in positions:
             lines.append(
                 f"#{p['ticket']} {p['type'].upper()} {p['symbol']} vol={p['volume']} PnL={p['profit']:.2f}"
             )
-        await update.message.reply_text("\n".join(lines))
+        await self.safe_reply_text(update, "\n".join(lines))
 
     async def _cmd_orders(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         session = self._get_session(update.effective_chat.id)
         if not session:
-            await update.message.reply_text("Please /login first.")
+            await self.safe_reply_text(update, "Please /login first.")
             return
         orders = session.get_orders()
         if not orders:
-            await update.message.reply_text("No pending orders.")
+            await self.safe_reply_text(update, "No pending orders.")
             return
         lines: List[str] = []
         for o in orders:
             lines.append(
                 f"#{o['ticket']} {o['symbol']} type={o['type']} vol={o['volume']} price={o['price_open']}"
             )
-        await update.message.reply_text("\n".join(lines))
+        await self.safe_reply_text(update, "\n".join(lines))
 
     async def _cmd_close_all(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         session = self._get_session(update.effective_chat.id)
         if not session:
-            await update.message.reply_text("Please /login first.")
+            await self.safe_reply_text(update, "Please /login first.")
             return
         positions = session.get_positions()
         if not positions:
-            await update.message.reply_text("No open positions to close.")
+            await self.safe_reply_text(update, "No open positions to close.")
             return
         closed = 0
         for p in positions:
@@ -776,23 +984,23 @@ class TelegramBot:
                     closed += 1
             except Exception:
                 logger.exception("Error closing position")
-        await update.message.reply_text(f"Closed {closed} positions.")
+        await self.safe_reply_text(update, f"Closed {closed} positions.")
 
     async def _cmd_buy(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("Trading buttons are temporarily disabled.")
+        await self.safe_reply_text(update, "Trading buttons are temporarily disabled.")
 
     async def _cmd_sell(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("Trading buttons are temporarily disabled.")
+        await self.safe_reply_text(update, "Trading buttons are temporarily disabled.")
 
     async def _place_market(self, update: Update, order_type: str):
         # Best-effort TP/SL using defaults and account-based lot sizing via controller logic
         session = self._get_session(update.effective_chat.id)
         if not session:
-            await update.message.reply_text("Please /login first.")
+            await self.safe_reply_text(update, "Please /login first.")
             return
         prices = session.get_current_price()
         if not prices:
-            await update.message.reply_text("Unable to get current price.")
+            await self.safe_reply_text(update, "Unable to get current price.")
             return
         point = session.symbol_info.point if session.symbol_info else 0.0001
         entry_price = prices['ask'] if order_type == 'buy' else prices['bid']
@@ -806,7 +1014,7 @@ class TelegramBot:
         # Risk-based lot size
         account_info = session.get_account_info()
         if not account_info:
-            await update.message.reply_text("Account info unavailable.")
+            await self.safe_reply_text(update, "Account info unavailable.")
             return
         risk_amount = account_info['balance'] * (self.current_risk_percentage / 100)
         sl_points = int(abs(entry_price - sl) / max(point, 1e-9))
@@ -826,7 +1034,7 @@ class TelegramBot:
             except Exception:
                 sym = SYMBOL
             ticket = result.get('order') if isinstance(result, dict) else None
-            await update.message.reply_text(
+            await self.safe_reply_text(update, 
                 f"{order_type.title()} order placed: {sym} vol={volume} | Ticket: {ticket if ticket is not None else 'n/a'}"
             )
         else:
@@ -834,9 +1042,9 @@ class TelegramBot:
             try:
                 import MetaTrader5 as mt5
                 err = mt5.last_error()
-                await update.message.reply_text(f"Order failed. MT5: {err}")
+                await self.safe_reply_text(update, f"Order failed. MT5: {err}")
             except Exception:
-                await update.message.reply_text("Order failed. Check MT5 and permissions.")
+                await self.safe_reply_text(update, "Order failed. Check MT5 and permissions.")
 
     async def _cmd_set_risk(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Usage: /set_risk 1.5
@@ -846,9 +1054,9 @@ class TelegramBot:
             if value <= 0 or value > 10:
                 raise ValueError
             self.current_risk_percentage = value
-            await update.message.reply_text(f"Risk per trade set to {value}%")
+            await self.safe_reply_text(update, f"Risk per trade set to {value}%")
         except Exception:
-            await update.message.reply_text("Usage: /set_risk <percent>. Example: /set_risk 1.5")
+            await self.safe_reply_text(update, "Usage: /set_risk <percent>. Example: /set_risk 1.5")
 
     async def _cmd_set_tp_sl(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Usage: /set_tp_sl 100 50
@@ -859,11 +1067,11 @@ class TelegramBot:
                 raise ValueError
             self.default_tp_points = tp
             self.default_sl_points = sl
-            await update.message.reply_text(
+            await self.safe_reply_text(update, 
                 f"Defaults set. TP={tp} points, SL={sl} points"
             )
         except Exception:
-            await update.message.reply_text("Usage: /set_tp_sl <tp_points> <sl_points>")
+            await self.safe_reply_text(update, "Usage: /set_tp_sl <tp_points> <sl_points>")
 
     async def _cmd_performance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
@@ -871,13 +1079,67 @@ class TelegramBot:
         # Get user-specific session stats
         user_session = self.controller._user_sessions.get(chat_id)
         if not user_session:
-            await update.message.reply_text("❌ No active trading session. Please /login first.")
+            await self.safe_reply_text(update, f"❌ No active trading session. Please /login first.")
             return
             
         stats = user_session.get('stats', {})
         if not stats:
-            await update.message.reply_text("No stats available.")
-            return
+            stats = {}
+            user_session['stats'] = stats
+
+        # Reconcile stats from MT5 history to capture broker-closed positions (TP/SL) even if missed in-loop
+        try:
+            session = user_session.get('connector') or self._get_session(chat_id)
+            session_start = stats.get('session_start')
+            # Normalize session_start to datetime when possible
+            from datetime import datetime, timedelta
+            start_dt = None
+            if session_start and hasattr(session_start, 'strftime'):
+                start_dt = session_start
+            elif isinstance(session_start, str):
+                try:
+                    # Best-effort parse common format '%Y-%m-%d %H:%M' used in display
+                    start_dt = datetime.strptime(session_start, '%Y-%m-%d %H:%M')
+                except Exception:
+                    start_dt = None
+
+            deals = []
+            if session:
+                if start_dt:
+                    try:
+                        from datetime import datetime as _dt
+                        deals = session.get_history_deals(start_dt, _dt.now())
+                    except Exception:
+                        # Fallback to day if direct range fails
+                        deals = session.get_recent_history('day')
+                else:
+                    deals = session.get_recent_history('day')
+
+            # Compute W/L and PnL from deals
+            reconciled_wins = 0
+            reconciled_losses = 0
+            reconciled_profit = 0.0
+            total_deals = 0
+            for d in deals or []:
+                pnl = float(d.get('profit', 0.0) or 0.0)
+                reconciled_profit += pnl
+                # Count only closed position deals (all returned here are deals)
+                total_deals += 1
+                if pnl > 0:
+                    reconciled_wins += 1
+                elif pnl < 0:
+                    reconciled_losses += 1
+
+            # If reconciled totals indicate missing in-memory stats, prefer reconciled values
+            if total_deals > 0:
+                stats['winning_trades'] = reconciled_wins
+                stats['losing_trades'] = reconciled_losses
+                # Keep existing total_trades if larger (includes opens), else use deals count
+                stats['total_trades'] = max(int(stats.get('total_trades', 0) or 0), total_deals)
+                stats['total_profit'] = float(reconciled_profit)
+        except Exception:
+            # Silent fallback; keep existing stats if reconciliation fails
+            pass
             
         total = int(stats.get('total_trades', 0) or 0)
         win = int(stats.get('winning_trades', 0) or 0)
@@ -905,72 +1167,171 @@ class TelegramBot:
             f"**Total P/L:** {profit:.2f}\n"
             f"**Session Started:** {session_display}"
         )
-        await update.message.reply_text(msg, parse_mode='Markdown')
+        await self.safe_reply_text(update, msg, parse_mode='Markdown')
 
     async def _cmd_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        # Usage: /history [day|week|month], default day
-        period = 'day'
+        # Usage: /history [today|day|week|month|last], default today
+        period = 'today'
         if context.args:
             arg = context.args[0].lower()
-            if arg in ('day', 'week', 'month'):
+            if arg in ('today', 'day', 'week', 'month', 'last'):
                 period = arg
+        
         session = self._get_session(update.effective_chat.id)
         if not session:
-            await update.message.reply_text("Please /login first.")
+            await self.safe_reply_text(update, "Please /login first.")
             return
         
-        # Get history deals - ensure we get all symbols
+        # Get history deals from MT5 only - no fallback to close_reasons
         deals = session.get_recent_history(period)
+        
+        # Extra safety: strictly filter to today's calendar date when requested
+        if period == 'today' and deals:
+            try:
+                from datetime import datetime as _dt
+                today = _dt.now().date()
+                logger.info(f"Filtering MT5 deals for today's date: {today}")
+                
+                filtered_deals = []
+                for d in deals:
+                    if hasattr(d.get('time'), 'date'):
+                        deal_date = d['time'].date()
+                        logger.debug(f"MT5 Deal {d.get('ticket', 'unknown')} date: {deal_date}")
+                        if deal_date == today:
+                            filtered_deals.append(d)
+                        else:
+                            logger.debug(f"Excluding MT5 deal {d.get('ticket', 'unknown')} - date {deal_date} != today {today}")
+                
+                logger.info(f"Filtered {len(filtered_deals)} MT5 deals for today out of {len(deals)} total")
+                deals = filtered_deals
+            except Exception as e:
+                logger.exception(f"Error filtering MT5 deals for today: {e}")
+                pass
+        
+        # Only show MT5 deal history - no fallback
         if not deals:
-            await update.message.reply_text("No recent history found.")
+            await self.safe_reply_text(update, "No MT5 trading history found for the selected period.")
             return
         
         # Group by symbol and show totals
         symbol_totals = {}
         lines = []
+        # Map position_id -> original side from open deal so close side is correct
+        pos_side: Dict = {}
+        try:
+            for d in deals:
+                pid = d.get('position_id')
+                if not pid:
+                    continue
+                if d.get('is_close', False):
+                    continue
+                t = d.get('type')
+                side = None
+                try:
+                    if t == 0:
+                        side = 'BUY'
+                    elif t == 1:
+                        side = 'SELL'
+                except Exception:
+                    side = None
+                if side:
+                    pos_side[pid] = side
+        except Exception:
+            pass
         
-        # Show all deals, not just last 20, to ensure we see all symbols
-        for d in deals:
+        # Show only close deals (DEAL_ENTRY_OUT) to reflect trade exits
+        # Show each close deal individually (match MT5), deriving side from original open when available
+        # Order by time (most recent first)
+        close_deals_sorted = sorted(
+            [x for x in deals if x.get('is_close', False)],
+            key=lambda x: x['time'],
+            reverse=True  # Most recent first
+        )
+        
+        # Limit to last 20 positions for better readability
+        close_deals_sorted = close_deals_sorted[:20]
+        
+        for d in close_deals_sorted:
             symbol = d['symbol']
+            pnl = float(d['profit'] or 0.0)
             if symbol not in symbol_totals:
                 symbol_totals[symbol] = {'count': 0, 'total_pnl': 0.0}
             symbol_totals[symbol]['count'] += 1
-            symbol_totals[symbol]['total_pnl'] += d['profit']
+            symbol_totals[symbol]['total_pnl'] += pnl
             
-            dt = d['time'].strftime('%Y-%m-%d %H:%M')
-            lines.append(
-                f"{dt} {symbol} vol={d['volume']} price={d['price']} P/L={d['profit']:.2f}"
-            )
+            dt = d['time'].strftime('%Y-%m-%d %I:%M %p')
+            pid = d.get('position_id')
+            side = pos_side.get(pid) or ''
+            volume = float(d['volume'] or 0.0)
+            price = float(d['price'] or 0.0)
+            ticket = int(d.get('ticket') or 0)
+            
+            # Choose emoji based on profit
+            if pnl > 0:
+                emoji = "💰"
+            elif pnl < 0:
+                emoji = "📉"
+            else:
+                emoji = "➖"
+            
+            # Build MT5-only line (no close_reasons integration)
+            line_parts = [
+                f"{emoji} **#{ticket}** {symbol}",
+                f"📅 {dt}",
+                f"📊 {side} {volume:.2f} @ {price:.5f}",
+                f"💵 P/L: {pnl:.2f}"
+            ]
+            
+            lines.append("\n".join(line_parts) + "\n")  # Add extra newline after each position
         
         # Add summary at the top for better visibility
         if symbol_totals:
-            summary_lines = ["📊 History Summary:"]
-            for symbol, totals in symbol_totals.items():
-                summary_lines.append(f"{symbol}: {totals['count']} deals, P/L: {totals['total_pnl']:.2f}")
-            summary_lines.append("")  # Empty line separator
+            summary_lines = ["📊 **History Summary**\n"]
+            total_trades = sum(totals['count'] for totals in symbol_totals.values())
+            total_pnl = sum(totals['total_pnl'] for totals in symbol_totals.values())
             
-            # Combine summary with deal details
-            full_message = "\n".join(summary_lines + lines)
-        else:
-            full_message = "\n".join(lines)
+            summary_lines.append(f"📈 **Total Trades:** {total_trades}")
+            summary_lines.append(f"💵 **Total P/L:** {total_pnl:.2f}")
+            summary_lines.append("")
+            
+            for symbol, totals in sorted(symbol_totals.items()):
+                summary_lines.append(f"• {symbol}: {totals['count']} trades, P/L: {totals['total_pnl']:.2f}")
+            summary_lines.append("")
         
-        # Split message if too long (Telegram has 4096 char limit)
-        if len(full_message) > 4000:
-            # Send summary first
-            await update.message.reply_text("\n".join(summary_lines))
-            # Then send deals in chunks
-            chunk_size = 20
-            for i in range(0, len(lines), chunk_size):
-                chunk = lines[i:i+chunk_size]
-                await update.message.reply_text("\n".join(chunk))
+        # Combine and send - add extra spacing between positions
+        full_text = "\n".join(summary_lines + lines)
+        
+        # Telegram message length limit
+        if len(full_text) > 4000:
+            # Split into chunks
+            chunks = []
+            current_chunk = []
+            current_length = 0
+            
+            for line in lines:
+                line_length = len(line) + 1
+                if current_length + line_length > 3500:
+                    if current_chunk:
+                        chunks.append("\n".join(summary_lines + current_chunk))
+                        current_chunk = []
+                        current_length = 0
+                current_chunk.append(line)
+                current_length += line_length
+            
+            if current_chunk:
+                chunks.append("\n".join(summary_lines + current_chunk))
+            
+            for i, chunk in enumerate(chunks):
+                prefix = f"**(Part {i+1}/{len(chunks)})**\n\n" if len(chunks) > 1 else ""
+                await self.safe_reply_text(update, prefix + chunk, parse_mode='Markdown')
         else:
-            await update.message.reply_text(full_message)
+            await self.safe_reply_text(update, full_text, parse_mode='Markdown')
 
     async def _cmd_debug(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Debug command to show session and symbol information"""
         session = self._get_session(update.effective_chat.id)
         if not session:
-            await update.message.reply_text("Please /login first.")
+            await self.safe_reply_text(update, "Please /login first.")
             return
         
         # Get current session info
@@ -995,20 +1356,424 @@ class TelegramBot:
             f"Session connected: {session.connected}",
         ]
         
-        await update.message.reply_text("\n".join(debug_info))
+        await self.safe_reply_text(update, "\n".join(debug_info))
+
+    async def _cmd_terminal_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show terminal status and provide troubleshooting options"""
+        chat_id = update.effective_chat.id
+        
+        try:
+            # Check if auto terminal manager is available
+            try:
+                from auto_terminal_manager import auto_terminal_manager
+                terminal_manager = auto_terminal_manager.terminal_manager
+                
+                status_lines = ["🖥️ **Terminal Status Report**\n"]
+                
+                # Get user's terminal name
+                session = self._get_session(chat_id)
+                terminal_name = None
+                if session:
+                    terminal_name = getattr(session, '_terminal_name', None)
+                
+                if terminal_name:
+                    status_lines.append(f"**Your Terminal:** {terminal_name}")
+                    
+                    # Check terminal status
+                    if terminal_name in terminal_manager.terminal_status:
+                        status = terminal_manager.terminal_status[terminal_name]
+                        status_emoji = {
+                            'running': '🟢',
+                            'starting': '🟡', 
+                            'stopped': '🔴',
+                            'failed': '❌',
+                            'crashed': '💥',
+                            'configured': '⚙️'
+                        }.get(status['status'], '❓')
+                        
+                        status_lines.extend([
+                            f"**Status:** {status_emoji} {status['status'].upper()}",
+                            f"**Process ID:** {status.get('process_id', 'None')}",
+                            f"**Last Check:** {status.get('last_check', 'Unknown')}",
+                            f"**Error Count:** {status.get('error_count', 0)}",
+                            f"**Account Connected:** {'✅' if status.get('account_connected', False) else '❌'}"
+                        ])
+                        
+                        # Check if process is actually running
+                        if terminal_name in terminal_manager.processes:
+                            process = terminal_manager.processes[terminal_name]
+                            if process.poll() is None:
+                                status_lines.append("**Process Status:** ✅ Running")
+                            else:
+                                status_lines.append(f"**Process Status:** ❌ Terminated (exit code: {process.returncode})")
+                        else:
+                            status_lines.append("**Process Status:** ❌ No process found")
+                    else:
+                        status_lines.append("**Status:** ❌ Terminal not found in manager")
+                        
+                    # Show troubleshooting options
+                    status_lines.extend([
+                        "\n**🔧 Troubleshooting Options:**",
+                        "• Try `/restart_terminal` to restart your terminal",
+                        "• Try `/kill_mt5` to kill all MT5 processes and restart",
+                        "• Check if MT5 is running manually on your computer",
+                        "• Verify your MT5 path in config.py"
+                    ])
+                else:
+                    status_lines.append("❌ No terminal assigned to your session")
+                    status_lines.append("Try logging in again with `/login`")
+                
+                # Show all terminals for admin users
+                if self._is_user_admin(chat_id):
+                    status_lines.extend([
+                        "\n**📋 All Terminals:**"
+                    ])
+                    for name, status in terminal_manager.terminal_status.items():
+                        emoji = {
+                            'running': '🟢',
+                            'starting': '🟡', 
+                            'stopped': '🔴',
+                            'failed': '❌',
+                            'crashed': '💥',
+                            'configured': '⚙️'
+                        }.get(status['status'], '❓')
+                        status_lines.append(f"• {name}: {emoji} {status['status']}")
+                
+                await self.safe_reply_text(update, "\n".join(status_lines), parse_mode='Markdown')
+                
+            except ImportError:
+                await self.safe_reply_text(update, f"❌ Terminal manager not available. Using shared terminal mode.")
+            except Exception as e:
+                await self.safe_reply_text(update, f"❌ Error checking terminal status: {e}")
+                
+        except Exception as e:
+            logger.exception("Error in terminal status command")
+            await self.safe_reply_text(update, f"❌ Error: {e}")
+
+    async def _cmd_restart_terminal(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Restart the user's terminal to fix connection issues"""
+        chat_id = update.effective_chat.id
+        
+        try:
+            # Check if auto terminal manager is available
+            try:
+                from auto_terminal_manager import auto_terminal_manager
+                terminal_manager = auto_terminal_manager.terminal_manager
+                
+                # Get user's terminal name
+                session = self._get_session(chat_id)
+                terminal_name = None
+                if session:
+                    terminal_name = getattr(session, '_terminal_name', None)
+                
+                if not terminal_name:
+                    await self.safe_reply_text(update, f"❌ No terminal assigned to your session. Try logging in again with `/login`")
+                    return
+                
+                await self.safe_reply_text(update, f"🔄 Restarting terminal: {terminal_name}")
+                
+                # Stop the terminal first
+                if terminal_name in terminal_manager.processes:
+                    try:
+                        process = terminal_manager.processes[terminal_name]
+                        process.terminate()
+                        await self.safe_reply_text(update, f"🛑 Stopping terminal process...")
+                        time.sleep(3)  # Wait for process to terminate
+                    except Exception as e:
+                        await self.safe_reply_text(update, f"⚠️ Warning: Could not stop process gracefully: {e}")
+                
+                # Update status
+                if terminal_name in terminal_manager.terminal_status:
+                    terminal_manager.terminal_status[terminal_name]['status'] = 'stopped'
+                    terminal_manager.terminal_status[terminal_name]['process_id'] = None
+                
+                # Remove from processes dict
+                if terminal_name in terminal_manager.processes:
+                    del terminal_manager.processes[terminal_name]
+                
+                await self.safe_reply_text(update, f"🔄 Starting terminal...")
+                
+                # Start the terminal again
+                success = terminal_manager.start_terminal(terminal_name)
+                
+                if success:
+                    await self.safe_reply_text(update, f"✅ Terminal {terminal_name} restarted successfully!")
+                    await self.safe_reply_text(update, "Try logging in again with `/login` to test the connection.")
+                else:
+                    await self.safe_reply_text(update, f"❌ Failed to restart terminal {terminal_name}")
+                    await self.safe_reply_text(update, "Try `/kill_mt5` to kill all MT5 processes and restart manually.")
+                
+            except ImportError:
+                await self.safe_reply_text(update, f"❌ Terminal manager not available. Using shared terminal mode.")
+            except Exception as e:
+                await self.safe_reply_text(update, f"❌ Error restarting terminal: {e}")
+                
+        except Exception as e:
+            logger.exception("Error in restart terminal command")
+            await self.safe_reply_text(update, f"❌ Error: {e}")
+
+    async def _cmd_test_connection(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Test MT5 connection and data fetching capabilities"""
+        session = self._get_session(update.effective_chat.id)
+        if not session:
+            await self.safe_reply_text(update, f"❌ No active session. Please /login first.")
+            return
+        
+        await self.safe_reply_text(update, "🧪 **Testing MT5 Connection...**\n", parse_mode='Markdown')
+        
+        try:
+            # Test 1: Basic connection
+            if not session.connected:
+                await self.safe_reply_text(update, f"❌ Not connected to MT5")
+                return
+            
+            await self.safe_reply_text(update, f"✅ Connected to MT5")
+            
+            # Test 2: Account info
+            account_info = session.get_account_info()
+            if account_info:
+                await self.safe_reply_text(update, f"✅ Account: {account_info['login']} ({account_info['server']})")
+            else:
+                await self.safe_reply_text(update, f"❌ Failed to get account info")
+            
+            # Test 3: Symbol availability
+            symbols_to_test = ["XAUUSD", "XAUUSD+", "EURUSD", "GBPUSD", "USDJPY"]
+            available_symbols = []
+            
+            for symbol in symbols_to_test:
+                symbol_info = session.get_symbol_info(symbol)
+                if symbol_info:
+                    available_symbols.append(symbol)
+            
+            if available_symbols:
+                await self.safe_reply_text(update, f"✅ Available symbols: {', '.join(available_symbols)}")
+            else:
+                await self.safe_reply_text(update, f"❌ No symbols available")
+            
+            # Test 4: Data fetching for different symbols and timeframes
+            timeframes_to_test = ["M1", "M5", "M15", "M30", "H1"]
+            
+            for symbol in available_symbols[:2]:  # Test first 2 available symbols
+                await self.safe_reply_text(update, f"\n📊 **Testing {symbol}:**")
+                
+                for tf in timeframes_to_test:
+                    try:
+                        rates = session.get_rates(symbol, tf, 10)
+                        if rates is not None and len(rates) > 0:
+                            await self.safe_reply_text(update, f"✅ {tf}: {len(rates)} bars")
+                        else:
+                            await self.safe_reply_text(update, f"❌ {tf}: Failed")
+                    except Exception as e:
+                        await self.safe_reply_text(update, f"❌ {tf}: Error - {str(e)}")
+            
+            # Test 5: Positions
+            positions = session.get_positions()
+            if positions is not None:
+                await self.safe_reply_text(update, f"\n📈 **Positions:** {len(positions)} open")
+            else:
+                await self.safe_reply_text(update, "\n📈 **Positions:** Failed to retrieve")
+            
+            await self.safe_reply_text(update, "\n✅ **Connection test completed!**")
+            
+        except Exception as e:
+            logger.exception("Error in connection test")
+            await self.safe_reply_text(update, f"❌ Test failed: {e}")
+
+    async def _cmd_available_symbols(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show available symbols for the current account"""
+        session = self._get_session(update.effective_chat.id)
+        if not session:
+            await self.safe_reply_text(update, f"❌ No active session. Please /login first.")
+            return
+        
+        await self.safe_reply_text(update, "📋 **Available Symbols for Your Account**\n", parse_mode='Markdown')
+        
+        try:
+            if not session.connected:
+                await self.safe_reply_text(update, f"❌ Not connected to MT5")
+                return
+            
+            # Get account info
+            account_info = session.get_account_info()
+            if account_info:
+                await self.safe_reply_text(update, f"🏦 **Account:** {account_info['login']} ({account_info['server']})\n")
+            
+            # Test common symbols and show which ones are available
+            common_symbols = [
+                "XAUUSD", "XAUUSD+", "GOLD", "XAUUSD.m",
+                "EURUSD", "EURUSD+", "EURUSD.m", 
+                "GBPUSD", "GBPUSD+", "GBPUSD.m",
+                "USDJPY", "USDJPY+", "USDJPY.m",
+                "AUDUSD", "AUDUSD+", "AUDUSD.m",
+                "USDCAD", "USDCAD+", "USDCAD.m",
+                "NZDUSD", "NZDUSD+", "NZDUSD.m",
+                "USDCHF", "USDCHF+", "USDCHF.m",
+                "EURJPY", "EURJPY+", "EURJPY.m",
+                "GBPJPY", "GBPJPY+", "GBPJPY.m",
+                "AUDJPY", "AUDJPY+", "AUDJPY.m",
+                "XAGUSD", "XAGUSD+", "SILVER", "XAGUSD.m"
+            ]
+            
+            available_symbols = []
+            unavailable_symbols = []
+            
+            for symbol in common_symbols:
+                symbol_info = session.get_symbol_info(symbol)
+                if symbol_info:
+                    available_symbols.append(symbol)
+                else:
+                    unavailable_symbols.append(symbol)
+            
+            if available_symbols:
+                await self.safe_reply_text(update, f"✅ **Available Symbols:**")
+                
+                # Group by base symbol
+                symbol_groups = {}
+                for symbol in available_symbols:
+                    base = symbol.replace('+', '').replace('.m', '').replace('#', '').replace('_', '')
+                    if base not in symbol_groups:
+                        symbol_groups[base] = []
+                    symbol_groups[base].append(symbol)
+                
+                # Show grouped symbols
+                for base, variants in symbol_groups.items():
+                    if len(variants) > 1:
+                        await self.safe_reply_text(update, f"• **{base}:** {', '.join(variants)}")
+                    else:
+                        await self.safe_reply_text(update, f"• {variants[0]}")
+                
+                # Show total count
+                await self.safe_reply_text(update, f"\n📊 **Total Available:** {len(available_symbols)} symbols")
+                
+                # Test data fetching for gold symbols
+                gold_symbols = [s for s in available_symbols if 'XAU' in s or 'GOLD' in s]
+                if gold_symbols:
+                    await self.safe_reply_text(update, f"\n🥇 **Testing Gold Symbols:**")
+                    for symbol in gold_symbols[:3]:  # Test first 3 gold symbols
+                        try:
+                            rates = session.get_rates(symbol, "M5", 5)
+                            if rates is not None and len(rates) > 0:
+                                await self.safe_reply_text(update, f"✅ {symbol}: M5 data available ({len(rates)} bars)")
+                            else:
+                                await self.safe_reply_text(update, f"⚠️ {symbol}: M5 data not available")
+                        except Exception as e:
+                            await self.safe_reply_text(update, f"❌ {symbol}: Error - {str(e)}")
+            else:
+                await self.safe_reply_text(update, f"❌ No common symbols found")
+            
+            # Show symbol detection example
+            if available_symbols:
+                test_symbol = "XAUUSD" if "XAUUSD" not in available_symbols else "XAUUSD+"
+                detected = session.find_available_symbol(test_symbol)
+                if detected:
+                    await self.safe_reply_text(update, f"\n🔍 **Symbol Detection Test:**")
+                    await self.safe_reply_text(update, f"Looking for: {test_symbol}")
+                    await self.safe_reply_text(update, f"Found: {detected}")
+            
+        except Exception as e:
+            logger.exception("Error in available symbols command")
+            await self.safe_reply_text(update, f"❌ Error: {e}")
+
+    async def _cmd_debug_timezone(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Debug timezone issues with trade history"""
+        session = self._get_session(update.effective_chat.id)
+        if not session:
+            await self.safe_reply_text(update, f"❌ No active session. Please /login first.")
+            return
+        
+        await self.safe_reply_text(update, "🕐 **Timezone Debug Information**\n", parse_mode='Markdown')
+        
+        try:
+            from datetime import datetime as _dt
+            import time
+            
+            # Show current time information
+            now_local = _dt.now()
+            now_utc = _dt.utcnow()
+            today_local = now_local.date()
+            
+            await self.safe_reply_text(update, 
+                f"**Current Time:**\n"
+                f"• Local: {now_local.strftime('%Y-%m-%d %I:%M %p')}\n"
+                f"• UTC: {now_utc.strftime('%Y-%m-%d %I:%M %p')}\n"
+                f"• Today's date: {today_local}\n"
+                f"• Timezone offset: {time.timezone / 3600} hours"
+            )
+            
+            # Get recent deals and show their timestamps
+            deals = session.get_recent_history('day')
+            if deals:
+                await self.safe_reply_text(update, f"\n**Recent Deals (last 24h):** {len(deals)} found")
+                
+                # Show first few deals with detailed timestamp info
+                for i, deal in enumerate(deals[:5]):
+                    deal_time = deal.get('time')
+                    if deal_time:
+                        deal_date = deal_time.date()
+                        is_today = deal_date == today_local
+                        
+                        await self.safe_reply_text(update, 
+                            f"**Deal #{deal.get('ticket', 'unknown')}:**\n"
+                            f"• Time: {deal_time.strftime('%Y-%m-%d %I:%M %p')}\n"
+                            f"• Date: {deal_date}\n"
+                            f"• Is Today: {'✅' if is_today else '❌'}\n"
+                            f"• Timestamp: {deal_time.timestamp()}"
+                        )
+                
+                # Count deals by date
+                date_counts = {}
+                for deal in deals:
+                    deal_time = deal.get('time')
+                    if deal_time:
+                        deal_date = deal_time.date()
+                        date_counts[deal_date] = date_counts.get(deal_date, 0) + 1
+                
+                await self.safe_reply_text(update, "\n**Deals by Date:**")
+                for date, count in sorted(date_counts.items()):
+                    is_today = date == today_local
+                    await self.safe_reply_text(update, f"• {date}: {count} deals {'(Today)' if is_today else ''}")
+            
+            else:
+                await self.safe_reply_text(update, f"❌ No deals found in last 24 hours")
+            
+        except Exception as e:
+            logger.exception("Error in timezone debug")
+            await self.safe_reply_text(update, f"❌ Error: {e}")
+
+    async def _cmd_force_cleanup_mt5(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Force cleanup all MT5 connections and processes (Admin only)"""
+        chat_id = update.effective_chat.id
+        
+        # Check if user is admin
+        if not self._is_admin(chat_id):
+            await self.safe_reply_text(update, f"❌ Admin access required")
+            return
+        
+        try:
+            await self.safe_reply_text(update, f"🔄 Starting force cleanup of all MT5 connections...\n\n🔄 Closing all open positions...\n🔄 Force closing all MT5 terminals...")
+            
+            # Import and call the force cleanup function
+            from mt5_connector import force_cleanup_all_mt5
+            force_cleanup_all_mt5()
+            
+            await self.safe_reply_text(update, f"✅ Force cleanup completed!\n\n🔄 All open positions closed\n🔄 All MT5 API connections disconnected\n🔄 All MT5 terminal processes force closed\n🔄 All processes cleaned up")
+            
+        except Exception as e:
+            await self.safe_reply_text(update, f"❌ Error during force cleanup: {str(e)}")
+            logger.error(f"Error in force cleanup command: {e}")
 
     async def _cmd_alerts_on(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         self.alerts_enabled = True
-        await update.message.reply_text("Alerts enabled.")
+        await self.safe_reply_text(update, "Alerts enabled.")
 
     async def _cmd_alerts_off(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         self.alerts_enabled = False
-        await update.message.reply_text("Alerts disabled.")
+        await self.safe_reply_text(update, "Alerts disabled.")
 
     async def _cmd_alerts_toggle(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         self.alerts_enabled = not self.alerts_enabled
         state = "enabled" if self.alerts_enabled else "disabled"
-        await update.message.reply_text(f"Alerts {state}.")
+        await self.safe_reply_text(update, f"Alerts {state}.")
 
     async def _cmd_news(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         import base64
@@ -1023,7 +1788,7 @@ class TelegramBot:
                 if len(context.args) >= 3:
                     category = context.args[2]
                 if not NEWS_API_KEY:
-                    await update.message.reply_text("NEWS_API_KEY not configured.")
+                    await self.safe_reply_text(update, "NEWS_API_KEY not configured.")
                     return
                 url = (
                     f"https://newsapi.org/v2/top-headlines?country={country}"
@@ -1031,19 +1796,19 @@ class TelegramBot:
                 )
                 resp = requests.get(url, timeout=10)
                 if resp.status_code != 200:
-                    await update.message.reply_text("Failed to fetch headlines.")
+                    await self.safe_reply_text(update, "Failed to fetch headlines.")
                     return
                 data = resp.json()
                 articles = data.get('articles', [])[:5]
                 if not articles:
-                    await update.message.reply_text("No headlines available.")
+                    await self.safe_reply_text(update, "No headlines available.")
                     return
                 lines = []
                 for a in articles:
                     title = a.get('title', 'Untitled')
                     source = (a.get('source') or {}).get('name', '')
                     lines.append(f"- {title} ({source})")
-                await update.message.reply_text("\n".join(lines))
+                await self.safe_reply_text(update, "\n".join(lines))
                 return
 
             # Default: Economic calendar via TradingEconomics API
@@ -1077,18 +1842,18 @@ class TelegramBot:
 
             resp = requests.get(url, timeout=10)
             if resp.status_code != 200:
-                await update.message.reply_text("Failed to fetch calendar. Check TE_API_CLIENT.")
+                await self.safe_reply_text(update, "Failed to fetch calendar. Check TE_API_CLIENT.")
                 return
             data = resp.json()
             if not data:
-                await update.message.reply_text("No upcoming events.")
+                await self.safe_reply_text(update, "No upcoming events.")
                 return
-            from datetime import datetime
+            from datetime import datetime as _dt
 
             def format_dt(dt_str: str) -> str:
                 try:
                     # Expecting ISO-like strings from TE
-                    dt = datetime.fromisoformat(dt_str.replace('Z', ''))
+                    dt = _dt.fromisoformat(dt_str.replace('Z', ''))
                     return dt.strftime('%b %d, %Y %H:%M UTC')
                 except Exception:
                     return dt_str
@@ -1106,11 +1871,11 @@ class TelegramBot:
 
             def parse_iso(dt_str: str):
                 try:
-                    return datetime.fromisoformat(dt_str.replace('Z', ''))
+                    return _dt.fromisoformat(dt_str.replace('Z', ''))
                 except Exception:
                     return None
 
-            now = datetime.utcnow()
+            now = _dt.utcnow()
             upcoming: List[tuple] = []
             past: List[tuple] = []
             for e in data:
@@ -1149,25 +1914,25 @@ class TelegramBot:
             if past:
                 blocks.append("🕘 Past\n" + "\n\n".join(render(e) for _, e in past[:5]))
 
-            await update.message.reply_text("\n\n".join(blocks))
+            await self.safe_reply_text(update, "\n\n".join(blocks))
 
             # Update keyboard with badge
             try:
                 is_admin = self._is_user_admin(update.effective_chat.id)
-                await update.message.reply_text(
+                await self.safe_reply_text(update, 
                     "Menu updated.", reply_markup=_build_main_reply_keyboard(len(upcoming), is_admin)
                 )
             except Exception:
                 pass
         except Exception:
             logger.exception("Error fetching news/calendar")
-            await update.message.reply_text("Error fetching news/calendar.")
+            await self.safe_reply_text(update, "Error fetching news/calendar.")
 
     async def _cmd_sessions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show all active MT5 sessions"""
         try:
             if not self._sessions:
-                await update.message.reply_text("No active MT5 sessions.")
+                await self.safe_reply_text(update, "No active MT5 sessions.")
                 return
             
             # Get current active account
@@ -1189,10 +1954,26 @@ class TelegramBot:
                 # Get account info
                 try:
                     info = session.get_account_info()
+                    terminal_info = session.get_terminal_info()
+                    
+                    # Debug terminal info
+                    logger.info(f"Session terminal_info for chat {chat_id}: {terminal_info}")
+                    logger.info(f"Session _dedicated_terminal: {session._dedicated_terminal}")
+                    logger.info(f"Session _terminal_name: {session._terminal_name}")
+                    
                     if info:
                         account_display = f"{info['login']} ({info['balance']:.2f} {info['currency']})"
                     else:
                         account_display = f"{session._login} (info unavailable)"
+                    
+                    # Add terminal type information
+                    if terminal_info['type'] == 'dedicated':
+                        terminal_display = f" [Terminal: {terminal_info['terminal_name']}]"
+                    else:
+                        terminal_display = " [Shared Terminal]"
+                    
+                    account_display += terminal_display
+                    
                 except Exception:
                     account_display = f"{session._login} (error)"
                 
@@ -1202,43 +1983,283 @@ class TelegramBot:
                 message_lines.append(f"\n🌐 Currently connected to: {current_account}")
             
             message = "\n".join(message_lines)
-            await update.message.reply_text(message, parse_mode='Markdown')
+            await self.safe_reply_text(update, message, parse_mode='Markdown')
             
         except Exception as e:
             logger.error(f"Error in sessions command: {e}")
-            await update.message.reply_text(f"❌ Error getting sessions: {e}")
+            await self.safe_reply_text(update, f"❌ Error getting sessions: {e}")
+
+    async def _cmd_terminals(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show terminal management information (Admin only)"""
+        try:
+            if not await self._check_admin_authorization(update, context):
+                return
+            
+            # Get all users from database
+            users = db_manager.get_all_bot_users()
+            if not users:
+                await self.safe_reply_text(update, "No users found in database.")
+                return
+            
+            message_lines = ["🖥️ <b>Terminal Management</b> (Admin Only)\n"]
+            
+            # Show users and their terminal status
+            message_lines.append("👥 <b>Users and Terminals:</b>\n")
+            
+            for user in users:
+                telegram_chat_id = user['telegram_chat_id']
+                is_admin = user['is_admin']
+                role_emoji = "👑" if is_admin else "👤"
+                role_text = "Admin" if is_admin else "User"
+                
+                # Get MT account for this user
+                account = db_manager.get_mt_account_by_bot_user_id(user['bot_user_id'])
+                
+                # Generate expected terminal name: tmn_ + telegram_chat_id
+                expected_terminal_name = f"tmn_{telegram_chat_id}"
+                
+                # Check if terminal exists in terminal manager and get current login info
+                terminal_status = "❓"
+                current_login = None
+                active_session_login = None
+                
+                # Check for active session first (real-time info)
+                if telegram_chat_id in self._sessions:
+                    session = self._sessions[telegram_chat_id]
+                    if session.is_active_connection():
+                        try:
+                            info = session.get_account_info()
+                            if info:
+                                active_session_login = info['login']
+                        except:
+                            active_session_login = session._login
+                
+                # Check terminal manager status
+                try:
+                    from auto_terminal_manager import auto_terminal_manager
+                    terminal_info = auto_terminal_manager.terminal_manager.get_terminal_status(expected_terminal_name)
+                    if 'status' in terminal_info:
+                        status = terminal_info['status']['status']
+                        terminal_status = {
+                            'running': '🟢',
+                            'stopped': '🔴',
+                            'starting': '🟡',
+                            'failed': '❌',
+                            'crashed': '💥',
+                            'configured': '⚪'
+                        }.get(status, '❓')
+                        
+                        # Get current login from terminal config if available
+                        if 'config' in terminal_info and terminal_info['config']:
+                            current_login = terminal_info['config'].login
+                    else:
+                        # If terminal not found in manager but user is active, show as running
+                        if active_session_login:
+                            terminal_status = '🟢'
+                except:
+                    # If terminal manager error but user is active, show as running
+                    if active_session_login:
+                        terminal_status = '🟢'
+                    else:
+                        terminal_status = "❓"
+                
+                # Determine what MT account info to show (prioritize active session)
+                if active_session_login:
+                    # Show active session login (most current info)
+                    message_lines.append(f"{role_emoji} <b>{telegram_chat_id}</b> ({role_text})")
+                    message_lines.append(f"   MT Account: {active_session_login} (🟢 Active)")
+                    message_lines.append(f"   Terminal: {expected_terminal_name} {terminal_status}")
+                elif account:
+                    # Show stored MT account from database
+                    mt_account = account['mt_account_number']
+                    message_lines.append(f"{role_emoji} <b>{telegram_chat_id}</b> ({role_text})")
+                    message_lines.append(f"   MT Account: {mt_account}")
+                    message_lines.append(f"   Terminal: {expected_terminal_name} {terminal_status}")
+                elif current_login and current_login != 0:
+                    # Show current login from terminal (user logged in but not stored in DB yet)
+                    message_lines.append(f"{role_emoji} <b>{telegram_chat_id}</b> ({role_text})")
+                    message_lines.append(f"   MT Account: {current_login} (Terminal)")
+                    message_lines.append(f"   Terminal: {expected_terminal_name} {terminal_status}")
+                else:
+                    # No MT account info available
+                    message_lines.append(f"{role_emoji} <b>{telegram_chat_id}</b> ({role_text})")
+                    message_lines.append(f"   MT Account: None")
+                    message_lines.append(f"   Terminal: {expected_terminal_name} {terminal_status}")
+                message_lines.append("")
+            
+            # Show terminal manager status if available
+            try:
+                from auto_terminal_manager import auto_terminal_manager
+                status = auto_terminal_manager.get_all_terminals_status()
+                
+                if 'terminals' in status and status['terminals']:
+                    message_lines.append("🖥️ <b>Terminal Manager Status:</b>\n")
+                    message_lines.append(f"Total Terminals: {status['total_terminals']}")
+                    message_lines.append(f"Running Terminals: {status['running_terminals']}\n")
+                    
+                    for name, info in status['terminals'].items():
+                        config = info['config']
+                        terminal_status = info['status']
+                        
+                        status_emoji = {
+                            'running': '🟢',
+                            'stopped': '🔴',
+                            'starting': '🟡',
+                            'failed': '❌',
+                            'crashed': '💥',
+                            'configured': '⚪'
+                        }.get(terminal_status['status'], '❓')
+                        
+                        message_lines.append(f"{status_emoji} <b>{name}</b>")
+                        message_lines.append(f"   Account: {config.login}")
+                        message_lines.append(f"   Status: {terminal_status['status']}")
+                        if terminal_status.get('process_id'):
+                            message_lines.append(f"   PID: {terminal_status['process_id']}")
+                        message_lines.append("")
+            except ImportError:
+                message_lines.append("⚠️ Terminal manager not available")
+            except Exception as e:
+                message_lines.append(f"⚠️ Terminal manager error: {e}")
+            
+            message = "\n".join(message_lines)
+            await self.safe_reply_text(update, message, parse_mode='HTML')
+                
+        except Exception as e:
+            logger.error(f"Error in terminals command: {e}")
+            await self.safe_reply_text(update, f"❌ Error getting terminal info: {e}")
+
+    async def _cmd_terminal_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Start a specific terminal (Admin only)"""
+        try:
+            if not await self._check_admin_authorization(update, context):
+                return
+            
+            args = context.args
+            if not args:
+                await self.safe_reply_text(update, "Usage: /terminal_start <terminal_name>")
+                return
+            
+            terminal_name = args[0]
+            
+            try:
+                from auto_terminal_manager import auto_terminal_manager
+                
+                if auto_terminal_manager.terminal_manager.start_terminal(terminal_name):
+                    await self.safe_reply_text(update, f"✅ Terminal '{terminal_name}' started successfully")
+                else:
+                    await self.safe_reply_text(update, f"❌ Failed to start terminal '{terminal_name}'")
+                    
+            except ImportError:
+                await self.safe_reply_text(update, f"❌ Auto Terminal Manager not available")
+                
+        except Exception as e:
+            logger.error(f"Error in terminal_start command: {e}")
+            await self.safe_reply_text(update, f"❌ Error starting terminal: {e}")
+
+    async def _cmd_terminal_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Stop a specific terminal (Admin only)"""
+        try:
+            if not await self._check_admin_authorization(update, context):
+                return
+            
+            args = context.args
+            if not args:
+                await self.safe_reply_text(update, "Usage: /terminal_stop <terminal_name>")
+                return
+            
+            terminal_name = args[0]
+            
+            try:
+                from auto_terminal_manager import auto_terminal_manager
+                
+                if auto_terminal_manager.terminal_manager.stop_terminal(terminal_name):
+                    await self.safe_reply_text(update, f"✅ Terminal '{terminal_name}' stopped successfully")
+                else:
+                    await self.safe_reply_text(update, f"❌ Failed to stop terminal '{terminal_name}'")
+                    
+            except ImportError:
+                await self.safe_reply_text(update, f"❌ Auto Terminal Manager not available")
+                
+        except Exception as e:
+            logger.error(f"Error in terminal_stop command: {e}")
+            await self.safe_reply_text(update, f"❌ Error stopping terminal: {e}")
+
+    async def _cmd_terminal_restart(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Restart a specific terminal (Admin only)"""
+        try:
+            if not await self._check_admin_authorization(update, context):
+                return
+            
+            args = context.args
+            if not args:
+                await self.safe_reply_text(update, "Usage: /terminal_restart <terminal_name>")
+                return
+            
+            terminal_name = args[0]
+            
+            try:
+                from auto_terminal_manager import auto_terminal_manager
+                
+                if auto_terminal_manager.terminal_manager.restart_terminal(terminal_name):
+                    await self.safe_reply_text(update, f"✅ Terminal '{terminal_name}' restarted successfully")
+                else:
+                    await self.safe_reply_text(update, f"❌ Failed to restart terminal '{terminal_name}'")
+                    
+            except ImportError:
+                await self.safe_reply_text(update, f"❌ Auto Terminal Manager not available")
+                
+        except Exception as e:
+            logger.error(f"Error in terminal_restart command: {e}")
+            await self.safe_reply_text(update, f"❌ Error restarting terminal: {e}")
+
+    async def _cmd_terminals_refresh(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Refresh terminals from database and apply path overrides (Admin only)"""
+        try:
+            if not await self._check_admin_authorization(update, context):
+                return
+            from auto_terminal_manager import auto_terminal_manager
+            ok = auto_terminal_manager.refresh_terminals()
+            if ok:
+                await self.safe_reply_text(update, f"✅ Terminals refreshed from database.")
+            else:
+                await self.safe_reply_text(update, f"❌ Failed to refresh terminals. Check logs.")
+        except ImportError:
+            await self.safe_reply_text(update, f"❌ Auto Terminal Manager not available")
+        except Exception as e:
+            logger.error(f"Error in terminals_refresh command: {e}")
+            await self.safe_reply_text(update, f"❌ Error refreshing terminals: {e}")
 
     async def _cmd_switch(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Switch to your MT5 account (force connection)"""
         try:
             session = self._get_session(update.effective_chat.id)
             if not session:
-                await update.message.reply_text("Please /login first.")
+                await self.safe_reply_text(update, "Please /login first.")
                 return
             
             # Force connection to this user's account
             if session.ensure_connection():
                 info = session.get_account_info()
                 if info:
-                    await update.message.reply_text(
+                    await self.safe_reply_text(update, 
                         f"✅ Switched to account: {info['login']}\n"
                         f"Balance: {info['balance']:.2f} {info['currency']}"
                     )
                 else:
-                    await update.message.reply_text(f"✅ Switched to account: {session._login}")
+                    await self.safe_reply_text(update, f"✅ Switched to account: {session._login}")
             else:
-                await update.message.reply_text("❌ Failed to switch to your account. Please try /login again.")
+                await self.safe_reply_text(update, f"❌ Failed to switch to your account. Please try /login again.")
                 
         except Exception as e:
             logger.error(f"Error in switch command: {e}")
-            await update.message.reply_text(f"❌ Error switching account: {e}")
+            await self.safe_reply_text(update, f"❌ Error switching account: {e}")
 
     async def _cmd_ai_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show AI strategy status"""
         try:
             # Check if AI is available
             if not hasattr(self.controller, 'ai_strategy') or self.controller.ai_strategy is None:
-                await update.message.reply_text("❌ AI Strategy not available. Please ensure AI components are properly installed.")
+                await self.safe_reply_text(update, f"❌ AI Strategy not available. Please ensure AI components are properly installed.")
                 return
             
             ai_strategy = self.controller.ai_strategy
@@ -1306,18 +2327,18 @@ class TelegramBot:
                 message_lines.append("• No models available")
             
             message = "\n".join(message_lines)
-            await update.message.reply_text(message, parse_mode='HTML')
+            await self.safe_reply_text(update, message, parse_mode='HTML')
             
         except Exception as e:
             logger.error(f"Error in AI status command: {e}")
-            await update.message.reply_text(f"❌ Error getting AI status: {e}")
+            await self.safe_reply_text(update, f"❌ Error getting AI status: {e}")
 
     async def _cmd_ai_train(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Train AI models"""
         try:
             # Check if AI is available
             if not hasattr(self.controller, 'ai_strategy') or self.controller.ai_strategy is None:
-                await update.message.reply_text("❌ AI Strategy not available. Please ensure AI components are properly installed.")
+                await self.safe_reply_text(update, f"❌ AI Strategy not available. Please ensure AI components are properly installed.")
                 return
             
             # Get data periods parameter
@@ -1327,18 +2348,18 @@ class TelegramBot:
                     data_periods = int(context.args[0])
                     data_periods = max(500, min(data_periods, 10000))  # Limit between 500-10000
                 except ValueError:
-                    await update.message.reply_text("❌ Invalid data periods. Using default 2000.")
+                    await self.safe_reply_text(update, f"❌ Invalid data periods. Using default 2000.")
             
-            await update.message.reply_text(f"🤖 Starting AI training with {data_periods} data points...")
+            await self.safe_reply_text(update, f"🤖 Starting AI training with {data_periods} data points...")
             
             # Get historical data and train
             session = self._get_session(update.effective_chat.id)
             if not session:
-                await update.message.reply_text("Please /login first.")
+                await self.safe_reply_text(update, "Please /login first.")
                 return
             
             # Send progress update
-            progress_msg = await update.message.reply_text("📊 Fetching historical data...")
+            progress_msg = await self.safe_reply_text(update, "📊 Fetching historical data...")
             
             # Get historical data for training
             historical_data = []
@@ -1354,7 +2375,7 @@ class TelegramBot:
                     continue
             
             if not historical_data:
-                await update.message.reply_text("❌ Failed to get historical data for training")
+                await self.safe_reply_text(update, f"❌ Failed to get historical data for training")
                 return
             
             # Combine data
@@ -1377,10 +2398,10 @@ class TelegramBot:
                 # Ensure we have the required OHLC columns
                 required_columns = ['open', 'high', 'low', 'close']
                 if not all(col in combined_data.columns for col in required_columns):
-                    await update.message.reply_text("❌ Historical data missing required OHLC columns")
+                    await self.safe_reply_text(update, f"❌ Historical data missing required OHLC columns")
                     return
             else:
-                await update.message.reply_text("❌ No historical data available for training")
+                await self.safe_reply_text(update, f"❌ No historical data available for training")
                 return
             
             # Update progress
@@ -1390,7 +2411,7 @@ class TelegramBot:
             result = self.controller.ai_strategy.train_models(combined_data)
             
             if 'error' in result:
-                await update.message.reply_text(f"❌ Training failed: {result['error']}")
+                await self.safe_reply_text(update, f"❌ Training failed: {result['error']}")
             else:
                 # Compute per-symbol accuracy using the trained ensemble
                 try:
@@ -1432,11 +2453,12 @@ class TelegramBot:
                     sym_tag = ",".join(sym_list[:5])
                     if len(sym_list) > 5:
                         sym_tag += ",…"
-                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    from datetime import datetime as _dt
+                    timestamp = _dt.now().strftime('%Y%m%d_%H%M%S')
                     safe_tag = sym_tag.replace('/', '').replace(' ', '')
                     csv_path = os.path.join('ai/data', f'train_{safe_tag}_{timestamp}.csv')
                     combined_data.to_csv(csv_path, index=False)
-                    await update.message.reply_text("💾 Training dataset saved successfully")
+                    await self.safe_reply_text(update, "💾 Training dataset saved successfully")
                 except Exception as ex:
                     logger.warning(f"Failed to export training dataset: {ex}")
 
@@ -1469,18 +2491,18 @@ class TelegramBot:
                     pass
                 
                 message = "\n".join(message_lines)
-                await update.message.reply_text(message, parse_mode='HTML')
+                await self.safe_reply_text(update, message, parse_mode='HTML')
             
         except Exception as e:
             logger.error(f"Error in AI train command: {e}")
-            await update.message.reply_text(f"❌ Training error: {e}")
+            await self.safe_reply_text(update, f"❌ Training error: {e}")
 
     async def _cmd_ai_performance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show AI performance report"""
         try:
             # Check if AI is available
             if not hasattr(self.controller, 'ai_strategy') or self.controller.ai_strategy is None:
-                await update.message.reply_text("❌ AI Strategy not available. Please ensure AI components are properly installed.")
+                await self.safe_reply_text(update, f"❌ AI Strategy not available. Please ensure AI components are properly installed.")
                 return
             
             ai_strategy = self.controller.ai_strategy
@@ -1559,23 +2581,23 @@ class TelegramBot:
                 pass
             
             message = "\n".join(message_lines)
-            await update.message.reply_text(message, parse_mode='Markdown')
+            await self.safe_reply_text(update, message, parse_mode='Markdown')
             
         except Exception as e:
             logger.error(f"Error in AI performance command: {e}")
-            await update.message.reply_text(f"❌ Error getting performance: {e}")
+            await self.safe_reply_text(update, f"❌ Error getting performance: {e}")
     
     async def _cmd_close_reasons(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show close reasons statistics"""
         try:
             if not self.controller or not hasattr(self.controller, 'get_close_reasons_stats'):
-                await update.message.reply_text("❌ Close reasons tracking not available")
+                await self.safe_reply_text(update, f"❌ Close reasons tracking not available")
                 return
             
             stats = self.controller.get_close_reasons_stats()
             
             if stats['total_closes'] == 0:
-                await update.message.reply_text("📊 **Close Reasons Report**\n\nNo positions closed yet.")
+                await self.safe_reply_text(update, "📊 **Close Reasons Report**\n\nNo positions closed yet.")
                 return
             
             message_parts = [
@@ -1615,11 +2637,11 @@ class TelegramBot:
                     )
             
             message = "\n".join(message_parts)
-            await update.message.reply_text(message, parse_mode='HTML')
+            await self.safe_reply_text(update, message, parse_mode='HTML')
             
         except Exception as e:
             logger.error(f"Error in close reasons command: {e}")
-            await update.message.reply_text("❌ Error retrieving close reasons data")
+            await self.safe_reply_text(update, f"❌ Error retrieving close reasons data")
 
     async def _cmd_db_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show database statistics (admin command)"""
@@ -1642,11 +2664,11 @@ class TelegramBot:
                 message_lines.append(f"Error: {stats['error']}")
             
             message = "\n".join(message_lines)
-            await update.message.reply_text(message)
+            await self.safe_reply_text(update, message)
             
         except Exception as e:
             logger.error(f"Error in database stats command: {e}")
-            await update.message.reply_text(f"❌ Error getting database stats: {e}")
+            await self.safe_reply_text(update, f"❌ Error getting database stats: {e}")
 
     async def _cmd_add_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Add a new bot user (admin command)"""
@@ -1655,13 +2677,13 @@ class TelegramBot:
             if not await self._check_admin_authorization(update, context):
                 return
             if not context.args:
-                await update.message.reply_text("Usage: /add_user <telegram_chat_id> [admin]")
+                await self.safe_reply_text(update, "Usage: /add_user <telegram_chat_id> [admin]")
                 return
             
             try:
                 telegram_chat_id = int(context.args[0])
             except ValueError:
-                await update.message.reply_text("❌ Invalid telegram_chat_id. Must be a number.")
+                await self.safe_reply_text(update, f"❌ Invalid telegram_chat_id. Must be a number.")
                 return
             
             # Check if admin flag is provided
@@ -1672,18 +2694,138 @@ class TelegramBot:
             
             if bot_user_id:
                 admin_status = "Admin" if is_admin else "Regular User"
-                await update.message.reply_text(
+                await self.safe_reply_text(update, 
                     f"✅ Added bot user successfully!\n"
                     f"Bot User ID: {bot_user_id}\n"
                     f"Telegram Chat ID: {telegram_chat_id}\n"
                     f"Role: {admin_status}"
                 )
             else:
-                await update.message.reply_text("❌ Failed to add bot user. User might already exist.")
+                await self.safe_reply_text(update, f"❌ Failed to add bot user. User might already exist.")
                 
         except Exception as e:
             logger.error(f"Error in add user command: {e}")
-            await update.message.reply_text(f"❌ Error adding user: {e}")
+            await self.safe_reply_text(update, f"❌ Error adding user: {e}")
+
+    async def _cmd_create_terminal(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Create terminal for existing user (admin command)"""
+        try:
+            # Check admin authorization first
+            if not await self._check_admin_authorization(update, context):
+                return
+            if len(context.args) < 2:
+                await self.safe_reply_text(update, "Usage: /create_terminal <telegram_chat_id> <mt_account_number>")
+                return
+            
+            try:
+                telegram_chat_id = int(context.args[0])
+                mt_account_number = int(context.args[1])
+            except ValueError:
+                await self.safe_reply_text(update, f"❌ Invalid arguments. Both telegram_chat_id and mt_account_number must be numbers.")
+                return
+            
+            # Check if user exists in database
+            user = db_manager.get_bot_user_by_telegram_chat_id(telegram_chat_id)
+            if not user:
+                await self.safe_reply_text(update, f"❌ User with Telegram Chat ID {telegram_chat_id} not found in database!")
+                return
+            
+            # Check if user already has an MT account
+            existing_account = db_manager.get_mt_account_by_bot_user_id(user['bot_user_id'])
+            if existing_account:
+                terminal_name = existing_account.get('terminal_name', 'Not set')
+                await self.safe_reply_text(update, 
+                    f"⚠️ User already has an MT account:\n"
+                    f"Account: {existing_account['mt_account_number']}\n"
+                    f"Terminal: {terminal_name}\n\n"
+                    f"Use /update_terminal to change the account number."
+                )
+                return
+            
+            # Create terminal for the user
+            try:
+                from auto_terminal_manager import auto_terminal_manager
+                
+                if auto_terminal_manager.create_terminal_for_user(user['bot_user_id'], mt_account_number):
+                    await self.safe_reply_text(update, 
+                        f"✅ Terminal created successfully!\n"
+                        f"User: {telegram_chat_id}\n"
+                        f"Account: {mt_account_number}\n"
+                        f"Terminal: user_{mt_account_number}\n\n"
+                        f"User can now login with:\n"
+                        f"/login {mt_account_number} <password> <server>"
+                    )
+                else:
+                    await self.safe_reply_text(update, f"❌ Failed to create terminal for user.")
+                    
+            except ImportError:
+                await self.safe_reply_text(update, f"❌ Auto Terminal Manager not available.")
+                
+        except Exception as e:
+            logger.error(f"Error in create terminal command: {e}")
+            await self.safe_reply_text(update, f"❌ Error creating terminal: {e}")
+
+    async def _cmd_delete_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Delete a specific user (admin command)"""
+        try:
+            # Check admin authorization first
+            if not await self._check_admin_authorization(update, context):
+                return
+            
+            if not context.args:
+                await self.safe_reply_text(update, "Usage: /delete_user <telegram_chat_id>")
+                return
+            
+            try:
+                telegram_chat_id = int(context.args[0])
+            except ValueError:
+                await self.safe_reply_text(update, f"❌ Invalid telegram_chat_id. Must be a number.")
+                return
+            
+            # Check if user exists
+            user = db_manager.get_bot_user_by_telegram_chat_id(telegram_chat_id)
+            if not user:
+                await self.safe_reply_text(update, f"❌ User with Telegram Chat ID {telegram_chat_id} not found in database!")
+                return
+            
+            # Check if user is admin
+            if user['is_admin']:
+                await self.safe_reply_text(update, 
+                    f"⚠️ WARNING: User {telegram_chat_id} is an ADMIN!\n"
+                    f"❌ Admin users cannot be deleted for security reasons.\n"
+                    f"💡 Only regular users can be deleted."
+                )
+                return
+            
+            # Get user's MT account info
+            account = db_manager.get_mt_account_by_bot_user_id(user['bot_user_id'])
+            
+            # Show user info and ask for confirmation
+            user_info = (
+                f"📋 User to be deleted:\n"
+                f"• Bot User ID: {user['bot_user_id']}\n"
+                f"• Telegram Chat ID: {user['telegram_chat_id']}\n"
+                f"• Role: Regular User\n"
+            )
+            
+            if account:
+                user_info += f"• MT Account: {account['mt_account_number']}\n"
+                terminal_name = account.get('terminal_name', 'Not set')
+                user_info += f"• Terminal: {terminal_name}\n"
+            else:
+                user_info += f"• MT Account: None\n"
+            
+            user_info += f"\n⚠️ Type 'DELETE USER {telegram_chat_id}' to confirm deletion:"
+            
+            await self.safe_reply_text(update, user_info)
+            
+            # Store the expected confirmation in context
+            context.user_data['expected_confirmation'] = f"DELETE USER {telegram_chat_id}"
+            context.user_data['user_to_delete'] = user
+                
+        except Exception as e:
+            logger.error(f"Error in delete user command: {e}")
+            await self.safe_reply_text(update, f"❌ Error: {e}")
 
     async def _cmd_list_users(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """List all bot users (admin command)"""
@@ -1694,7 +2836,7 @@ class TelegramBot:
             users = db_manager.get_all_bot_users()
             
             if not users:
-                await update.message.reply_text("📋 Bot Users\n\nNo users found.")
+                await self.safe_reply_text(update, "📋 Bot Users\n\nNo users found.")
                 return
             
             message_lines = ["📋 Bot Users", ""]
@@ -1719,19 +2861,19 @@ class TelegramBot:
             if len(message) > 4000:
                 # Send first part
                 first_part = "\n".join(message_lines[:10])  # First 10 lines
-                await update.message.reply_text(first_part)
+                await self.safe_reply_text(update, first_part)
                 
                 # Send remaining parts
                 remaining_lines = message_lines[10:]
                 for i in range(0, len(remaining_lines), 10):
                     chunk = "\n".join(remaining_lines[i:i+10])
-                    await update.message.reply_text(chunk)
+                    await self.safe_reply_text(update, chunk)
             else:
-                await update.message.reply_text(message)
+                await self.safe_reply_text(update, message)
                 
         except Exception as e:
             logger.error(f"Error in list users command: {e}")
-            await update.message.reply_text(f"❌ Error listing users: {e}")
+            await self.safe_reply_text(update, f"❌ Error listing users: {e}")
 
     async def _cmd_admin_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show admin panel with available admin commands"""
@@ -1761,11 +2903,11 @@ class TelegramBot:
             ]
             
             message = "\n".join(message_lines)
-            await update.message.reply_text(message)
+            await self.safe_reply_text(update, message)
             
         except Exception as e:
             logger.error(f"Error in admin panel command: {e}")
-            await update.message.reply_text(f"❌ Error showing admin panel: {e}")
+            await self.safe_reply_text(update, f"❌ Error showing admin panel: {e}")
 
     async def _cmd_add_user_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Interactive add user via button (admin command)"""
@@ -1774,11 +2916,12 @@ class TelegramBot:
             if not await self._check_admin_authorization(update, context):
                 return
             
-            await update.message.reply_text(
+            await self.safe_reply_text(update, 
                 "👑 Add New User\n\n"
                 "Please send the Telegram Chat ID of the user you want to add.\n\n"
                 "Format: Just send the number (e.g., 123456789)\n\n"
-                "To add as admin: Send 'admin' after the chat ID (e.g., 123456789 admin)"
+                "To add as admin: Send 'admin' after the chat ID (e.g., 123456789 admin)\n\n"
+                "A terminal will be automatically created with name: tmn_[chat_id]"
             )
             
             # Set state for interactive user addition
@@ -1787,12 +2930,103 @@ class TelegramBot:
             
         except Exception as e:
             logger.error(f"Error in add user button command: {e}")
-            await update.message.reply_text(f"❌ Error: {e}")
+            await self.safe_reply_text(update, f"❌ Error: {e}")
+
+    async def _cmd_delete_user_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Interactive delete user via button (admin command)"""
+        try:
+            # Check admin authorization first
+            if not await self._check_admin_authorization(update, context):
+                return
+            
+            # Get all users to show available options
+            users = db_manager.get_all_bot_users()
+            if not users:
+                await self.safe_reply_text(update, "No users found in database.")
+                return
+            
+            # Separate admin and regular users
+            admin_users = [user for user in users if user['is_admin']]
+            regular_users = [user for user in users if not user['is_admin']]
+            
+            if not regular_users:
+                await self.safe_reply_text(update, f"✅ No regular users to delete. All users are admins.")
+                return
+            
+            # Show available users for deletion
+            user_list = "🗑️ Delete User\n\n"
+            user_list += f"📋 Available users for deletion ({len(regular_users)}):\n\n"
+            
+            for i, user in enumerate(regular_users[:10], 1):  # Show first 10 users
+                account = db_manager.get_mt_account_by_bot_user_id(user['bot_user_id'])
+                if account:
+                    user_list += f"{i}. User {user['telegram_chat_id']} (MT: {account['mt_account_number']})\n"
+                else:
+                    user_list += f"{i}. User {user['telegram_chat_id']} (No MT account)\n"
+            
+            if len(regular_users) > 10:
+                user_list += f"... and {len(regular_users) - 10} more users\n"
+            
+            user_list += f"\n⚠️ Admin users ({len(admin_users)}) cannot be deleted for security reasons.\n\n"
+            user_list += "Please send the Telegram Chat ID of the user you want to delete.\n"
+            user_list += "Format: Just send the number (e.g., 987654321)"
+            
+            await self.safe_reply_text(update, user_list)
+            
+            # Set state for interactive user deletion
+            chat_id = update.effective_chat.id
+            self._login_states[chat_id] = {"stage": "delete_user"}
+            
+        except Exception as e:
+            logger.error(f"Error in delete user button command: {e}")
+            await self.safe_reply_text(update, f"❌ Error: {e}")
 
     async def _on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.message or not update.message.text:
             return
         text = update.message.text.strip().lower()
+        
+        # Handle delete confirmation FIRST (before stage handling)
+        if context.user_data.get('expected_confirmation'):
+            expected = context.user_data['expected_confirmation']
+            if update.message.text.strip() == expected:
+                # Confirmation received, proceed with deletion
+                
+                # Check if it's a single user deletion
+                if 'user_to_delete' in context.user_data:
+                    # Single user deletion
+                    user = context.user_data['user_to_delete']
+                    try:
+                        # Remove MT account first (if exists)
+                        account = db_manager.get_mt_account_by_bot_user_id(user['bot_user_id'])
+                        if account:
+                            db_manager.remove_mt_account(user['bot_user_id'])
+
+                        # Remove user
+                        if db_manager.remove_bot_user(user['telegram_chat_id']):
+                            await self.safe_reply_text(update, 
+                                f"✅ User deletion complete!\n"
+                                f"🗑️ Deleted user: {user['telegram_chat_id']}\n"
+                                f"✅ User and associated data removed"
+                            )
+                        else:
+                            await self.safe_reply_text(update, f"❌ Failed to delete user.")
+                    except Exception as e:
+                        logger.error(f"Error deleting user {user['telegram_chat_id']}: {e}")
+                        await self.safe_reply_text(update, f"❌ Error deleting user: {e}")
+                
+                # Clear context and login state
+                context.user_data.pop('expected_confirmation', None)
+                context.user_data.pop('user_to_delete', None)
+                self._login_states.pop(chat_id, None)
+                
+            else:
+                await self.safe_reply_text(update, f"❌ Confirmation text doesn't match. Deletion cancelled.")
+                context.user_data.pop('expected_confirmation', None)
+                context.user_data.pop('user_to_delete', None)
+                self._login_states.pop(chat_id, None)
+            return
+        
         # Handle interactive login wizard and admin functions
         chat_id = update.effective_chat.id
         state = self._login_states.get(chat_id)
@@ -1803,7 +3037,7 @@ class TelegramBot:
                 try:
                     parts = update.message.text.strip().split()
                     if len(parts) < 1:
-                        await update.message.reply_text("❌ Please provide a Telegram Chat ID.")
+                        await self.safe_reply_text(update, f"❌ Please provide a Telegram Chat ID.")
                         return
                     
                     telegram_chat_id = int(parts[0])
@@ -1814,34 +3048,141 @@ class TelegramBot:
                     
                     if bot_user_id:
                         admin_status = "Admin" if is_admin else "Regular User"
-                        await update.message.reply_text(
-                            f"✅ Added bot user successfully!\n"
-                            f"Bot User ID: {bot_user_id}\n"
-                            f"Telegram Chat ID: {telegram_chat_id}\n"
-                            f"Role: {admin_status}"
-                        )
+                        
+                        # Generate terminal name: tmn_ + telegram_chat_id
+                        terminal_name = f"tmn_{telegram_chat_id}"
+                        
+                        # Create terminal for this user (without MT account)
+                        try:
+                            from auto_terminal_manager import auto_terminal_manager
+                            
+                            # Create terminal configuration
+                            from terminal_manager import TerminalConfig
+                            config = TerminalConfig(
+                                name=terminal_name,
+                                terminal_path=auto_terminal_manager._get_mt5_path(),
+                                login=0,  # Will be set when user logs in
+                                password="",  # Will be provided during login
+                                server="",    # Will be provided during login
+                                symbol="EURUSD",  # Use global config
+                                timeframe="M15",  # Use global config
+                                auto_start=False  # Don't auto-start without credentials
+                            )
+                            
+                            # Add to terminal manager
+                            if auto_terminal_manager.terminal_manager.add_terminal(config):
+                                await self.safe_reply_text(update, 
+                                    f"✅ User setup complete!\n"
+                                    f"Bot User ID: {bot_user_id}\n"
+                                    f"Telegram Chat ID: {telegram_chat_id}\n"
+                                    f"Terminal: {terminal_name}\n"
+                                    f"Role: {admin_status}\n\n"
+                                    f"🎉 User can now login and use their dedicated terminal!"
+                                )
+                            else:
+                                await self.safe_reply_text(update, 
+                                    f"⚠️ User added but terminal creation failed.\n"
+                                    f"Bot User ID: {bot_user_id}\n"
+                                    f"Telegram Chat ID: {telegram_chat_id}\n"
+                                    f"Terminal: {terminal_name}\n"
+                                    f"Role: {admin_status}\n\n"
+                                    f"User can still login, but will use shared terminal."
+                                )
+                        except ImportError:
+                            await self.safe_reply_text(update, 
+                                f"⚠️ User added but terminal manager not available.\n"
+                                f"Bot User ID: {bot_user_id}\n"
+                                f"Telegram Chat ID: {telegram_chat_id}\n"
+                                f"Terminal: {terminal_name}\n"
+                                f"Role: {admin_status}\n\n"
+                                f"User can still login, but will use shared terminal."
+                            )
+                        except Exception as e:
+                            await self.safe_reply_text(update, 
+                                f"⚠️ User added but terminal creation failed: {e}\n"
+                                f"Bot User ID: {bot_user_id}\n"
+                                f"Telegram Chat ID: {telegram_chat_id}\n"
+                                f"Terminal: {terminal_name}\n"
+                                f"Role: {admin_status}\n\n"
+                                f"User can still login, but will use shared terminal."
+                            )
                     else:
-                        await update.message.reply_text("❌ Failed to add bot user. User might already exist.")
+                        await self.safe_reply_text(update, f"❌ Failed to add bot user. User might already exist.")
                     
                 except ValueError:
-                    await update.message.reply_text("❌ Invalid Telegram Chat ID. Must be a number.")
+                    await self.safe_reply_text(update, f"❌ Invalid Telegram Chat ID. Must be a number.")
                 except Exception as e:
-                    await update.message.reply_text(f"❌ Error adding user: {e}")
+                    await self.safe_reply_text(update, f"❌ Error adding user: {e}")
                 finally:
+                    self._login_states.pop(chat_id, None)
+                return
+            elif stage == "delete_user":
+                # Handle interactive user deletion
+                try:
+                    telegram_chat_id = int(update.message.text.strip())
+                    
+                    # Check if user exists
+                    user = db_manager.get_bot_user_by_telegram_chat_id(telegram_chat_id)
+                    if not user:
+                        await self.safe_reply_text(update, f"❌ User with Telegram Chat ID {telegram_chat_id} not found in database!")
+                        self._login_states.pop(chat_id, None)
+                        return
+                    
+                    # Check if user is admin
+                    if user['is_admin']:
+                        await self.safe_reply_text(update, 
+                            f"⚠️ WARNING: User {telegram_chat_id} is an ADMIN!\n"
+                            f"❌ Admin users cannot be deleted for security reasons.\n"
+                            f"💡 Only regular users can be deleted."
+                        )
+                        self._login_states.pop(chat_id, None)
+                        return
+                    
+                    # Get user's MT account info
+                    account = db_manager.get_mt_account_by_bot_user_id(user['bot_user_id'])
+                    
+                    # Show user info and ask for confirmation
+                    user_info = (
+                        f"📋 User to be deleted:\n"
+                        f"• Bot User ID: {user['bot_user_id']}\n"
+                        f"• Telegram Chat ID: {user['telegram_chat_id']}\n"
+                        f"• Role: Regular User\n"
+                    )
+                    
+                    if account:
+                        user_info += f"• MT Account: {account['mt_account_number']}\n"
+                        terminal_name = account.get('terminal_name', 'Not set')
+                        user_info += f"• Terminal: {terminal_name}\n"
+                    else:
+                        user_info += f"• MT Account: None\n"
+                    
+                    user_info += f"\n⚠️ Type 'DELETE USER {telegram_chat_id}' to confirm deletion:"
+                    
+                    await self.safe_reply_text(update, user_info)
+                    
+                    # Store the expected confirmation in context
+                    context.user_data['expected_confirmation'] = f"DELETE USER {telegram_chat_id}"
+                    context.user_data['user_to_delete'] = user
+                    
+                except ValueError:
+                    await self.safe_reply_text(update, f"❌ Invalid Telegram Chat ID. Must be a number.")
+                    self._login_states.pop(chat_id, None)
+                except Exception as e:
+                    await self.safe_reply_text(update, f"❌ Error: {e}")
                     self._login_states.pop(chat_id, None)
                 return
             elif stage == "account":
                 try:
                     state["login"] = int(update.message.text.strip())
                     state["stage"] = "password"
-                    await update.message.reply_text("Enter Password:")
+                    await self.safe_reply_text(update, "Enter Password:")
                 except Exception:
-                    await update.message.reply_text("Invalid account. Enter numeric account:")
+                    await self.safe_reply_text(update, "Invalid account. Enter numeric account:")
                 return
             if stage == "password":
                 state["password"] = update.message.text.strip()
                 state["stage"] = "server"
-                await update.message.reply_text("Enter Server (e.g., VantageInternational-Demo):")
+                await self.safe_reply_text(update, "Enter Server (e.g., VantageInternational-Demo):")
                 return
             if stage == "server":
                 state["server"] = update.message.text.strip()
@@ -1850,47 +3191,88 @@ class TelegramBot:
                     # Check if user is already logged in with a different account
                     existing_session = self._sessions.get(chat_id)
                     if existing_session and existing_session._login != state["login"]:
-                        await update.message.reply_text(
+                        await self.safe_reply_text(update, 
                             f"You are already logged in with account {existing_session._login}. "
                             f"Please logout first before switching to account {state['login']}."
                         )
                         self._login_states.pop(chat_id, None)
                         return
                     
-                    session = MT5Connector(login=state["login"], password=state["password"], server=state["server"])
+                    # Skip terminal management for direct connections
+                    terminal_name = None
+                    logger.info(f"[Interactive] Using direct connection for account {state['login']}")
+
+                    # Ensure terminal exists and path is correct before connecting
+                    try:
+                        bot_user = db_manager.get_bot_user_by_telegram_chat_id(chat_id)
+                        if bot_user:
+                            db_manager.add_mt_account(bot_user['bot_user_id'], state["login"], chat_id)
+                            from auto_terminal_manager import auto_terminal_manager
+                            auto_terminal_manager.create_terminal_for_user(bot_user['bot_user_id'], state["login"])
+                            # If terminal already exists, ensure it uses the latest resolved MT5 path and login
+                            try:
+                                if terminal_name:
+                                    from terminal_manager import terminal_manager
+                                    if terminal_name in terminal_manager.terminals:
+                                        cfg = terminal_manager.terminals[terminal_name]
+                                        new_path = auto_terminal_manager._get_mt5_path()
+                                        if cfg.terminal_path != new_path or cfg.login != state["login"]:
+                                            cfg.terminal_path = new_path
+                                            cfg.login = state["login"]
+                                            logger.info(f"[Interactive] Updated terminal config for {terminal_name}: path={new_path}, login={state['login']}")
+                            except Exception as e:
+                                logger.warning(f"[Interactive] Could not ensure terminal config for {terminal_name}: {e}")
+                            if terminal_name:
+                                try:
+                                    auto_terminal_manager.terminal_manager.start_terminal(terminal_name)
+                                    logger.info(f"[Interactive] Started terminal {terminal_name} prior to connection")
+                                except Exception as e:
+                                    logger.warning(f"[Interactive] Could not start terminal {terminal_name}: {e}")
+                    except Exception as e:
+                        logger.warning(f"[Interactive] Pre-connection terminal setup failed: {e}")
+
+                    # Create connector with dedicated terminal when available
+                    await self.safe_reply_text(update, f"🔗 Connecting directly to MT5...")
+                    session = MT5Connector(
+                        login=state["login"],
+                        password=state["password"],
+                        server=state["server"],
+                        direct_connection=True
+                    )
+
                     if not session.connect():
                         try:
                             msg = session.get_last_error_message()
                         except Exception:
                             msg = "Login failed. Check credentials/server and try /login again."
-                        await update.message.reply_text(f"❌ {msg}")
+                        await self.safe_reply_text(update, f"❌ {msg}")
                     else:
                         self._sessions[chat_id] = session
-                        
-                        # Get bot user info and store MT account in database
-                        bot_user = db_manager.get_bot_user_by_telegram_chat_id(chat_id)
-                        if bot_user:
-                            db_manager.add_mt_account(bot_user['bot_user_id'], state["login"])
-                            logger.info(f"Stored MT account {state['login']} for bot_user_id {bot_user['bot_user_id']}")
+                        # Create/enable per-user trading session so performance and stats work
+                        try:
+                            self.controller.start_trading_for_chat(chat_id, session)
+                        except Exception as e:
+                            logger.warning(f"[Interactive] Failed to start trading session for chat {chat_id}: {e}")
                         
                         info = session.get_account_info() or {}
-                        await update.message.reply_text(
+                        await self.safe_reply_text(update,
                             f"✅ Logged in to account: {info.get('login', state['login'])}\n"
                             f"Balance: {info.get('balance', 0):.2f} {info.get('currency', '')}"
                         )
                         try:
                             count = await self._get_upcoming_count()
                             is_admin = self._is_user_admin(chat_id)
-                            await update.message.reply_text(
+                            await self.safe_reply_text(update,
                                 "Keyboard updated.", reply_markup=_build_main_reply_keyboard(count, is_admin)
                             )
                         except Exception:
                             pass
                 except Exception as e:
-                    await update.message.reply_text(f"Login error: {e}")
+                    await self.safe_reply_text(update, f"Login error: {e}")
                 finally:
                     self._login_states.pop(chat_id, None)
                 return
+        
         # Map keyboard labels to actions
         if text in ("info", "ℹ️ info"):
             await self._cmd_info(update, context)
@@ -1924,10 +3306,22 @@ class TelegramBot:
             await self._cmd_close_reasons(update, context)
         elif text in ("debug", "🐛 debug"):
             await self._cmd_debug(update, context)
+        elif text in ("terminal status", "🖥️ terminal status"):
+            await self._cmd_terminal_status(update, context)
+        elif text in ("restart terminal", "🔄 restart terminal"):
+            await self._cmd_restart_terminal(update, context)
+        elif text in ("test connection", "🧪 test connection"):
+            await self._cmd_test_connection(update, context)
+        elif text in ("available symbols", "📋 available symbols"):
+            await self._cmd_available_symbols(update, context)
+        elif text in ("debug timezone", "🕐 debug timezone"):
+            await self._cmd_debug_timezone(update, context)
         elif text in ("login", "🔑 login"):
             # kick off interactive login
             self._login_states[chat_id] = {"stage": "account"}
-            await update.message.reply_text("Please enter your Account (login) number:")
+            await self.safe_reply_text(update, "Please enter your Account (login) number:")
+        elif text in ("logout", "🚪 logout"):
+            await self._cmd_logout(update, context)
         # Admin-only button handlers
         elif text in ("admin panel", "👑 admin panel"):
             await self._cmd_admin_panel(update, context)
@@ -1937,6 +3331,12 @@ class TelegramBot:
             await self._cmd_list_users(update, context)
         elif text in ("db stats", "📊 db stats"):
             await self._cmd_db_stats(update, context)
+        elif text in ("delete user", "🗑️ delete user"):
+            await self._cmd_delete_user_button(update, context)
+        elif text in ("terminals", "🖥️ terminals"):
+            await self._cmd_terminals(update, context)
+        elif text in ("sessions", "🔄 sessions"):
+            await self._cmd_sessions(update, context)
         elif text == "show keyboard":
             await self._cmd_menu(update, context)
         elif text == "hide keyboard":
@@ -1973,9 +3373,17 @@ class TelegramBot:
         application.add_handler(CommandHandler("news", self._cmd_news))
         application.add_handler(CommandHandler("sessions", self._cmd_sessions))
         application.add_handler(CommandHandler("switch", self._cmd_switch))
+        # Terminal management commands (admin only)
+        application.add_handler(CommandHandler("terminals", self._cmd_terminals))
+        application.add_handler(CommandHandler("terminal_start", self._cmd_terminal_start))
+        application.add_handler(CommandHandler("terminal_stop", self._cmd_terminal_stop))
+        application.add_handler(CommandHandler("terminal_restart", self._cmd_terminal_restart))
+        application.add_handler(CommandHandler("force_cleanup_mt5", self._cmd_force_cleanup_mt5))
         # Admin commands
         application.add_handler(CommandHandler("db_stats", self._cmd_db_stats))
         application.add_handler(CommandHandler("add_user", self._cmd_add_user))
+        application.add_handler(CommandHandler("create_terminal", self._cmd_create_terminal))
+        application.add_handler(CommandHandler("delete_user", self._cmd_delete_user))
         application.add_handler(CommandHandler("list_users", self._cmd_list_users))
 
         # Inline callbacks for show/hide keyboard
@@ -1999,9 +3407,20 @@ class TelegramBot:
             asyncio.set_event_loop(loop)
             self._loop = loop
             # Build and run polling in this thread
+            # Configure rate limiter to prevent hitting Telegram's limits
+            # Very conservative settings to avoid any rate limit issues
+            rate_limiter = AIORateLimiter(
+                overall_max_rate=15,  # 15 messages per second overall (very conservative)
+                overall_time_period=1.0,
+                group_max_rate=10,    # 10 messages per minute for groups (very conservative)
+                group_time_period=60.0,
+                max_retries=5         # Retry up to 5 times on rate limit
+            )
+            
             application = (
                 ApplicationBuilder()
                 .token(TELEGRAM_BOT_TOKEN)
+                .rate_limiter(rate_limiter)
                 .post_init(self._post_init)
                 .build()
             )
@@ -2030,14 +3449,25 @@ class TelegramBot:
             # Alerts handlers removed per request
             application.add_handler(CommandHandler("news", self._cmd_news))
             application.add_handler(CommandHandler("sessions", self._cmd_sessions))
+            # Terminal management commands (admin only)
+            application.add_handler(CommandHandler("terminals", self._cmd_terminals))
+            application.add_handler(CommandHandler("terminal_start", self._cmd_terminal_start))
+            application.add_handler(CommandHandler("terminal_stop", self._cmd_terminal_stop))
+            application.add_handler(CommandHandler("terminal_restart", self._cmd_terminal_restart))
+            application.add_handler(CommandHandler("terminals_refresh", self._cmd_terminals_refresh))
             # Admin commands
             application.add_handler(CommandHandler("db_stats", self._cmd_db_stats))
             application.add_handler(CommandHandler("add_user", self._cmd_add_user))
+            application.add_handler(CommandHandler("create_terminal", self._cmd_create_terminal))
+            application.add_handler(CommandHandler("delete_user", self._cmd_delete_user))
             application.add_handler(CommandHandler("list_users", self._cmd_list_users))
             application.add_handler(CallbackQueryHandler(self._on_inline_toggle))
             # Text handler for reply keyboard buttons
             application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_text))
 
+            # Add global error handler for rate limiting
+            application.add_error_handler(self._error_handler)
+            
             self.application = application
             application.run_polling(allowed_updates=None, stop_signals=None)
         except Exception:
@@ -2046,16 +3476,36 @@ class TelegramBot:
     def start(self):
         if self._thread and self._thread.is_alive():
             return
+        # Start message queue worker
+        self._start_queue_worker()
         self._thread = threading.Thread(target=self._run_blocking, name="TelegramBot", daemon=True)
         self._thread.start()
 
     def stop(self):
         try:
+            # Stop message queue worker
+            self._queue_worker_running = False
+            try:
+                self._message_queue.put(None, timeout=1)  # Shutdown signal
+            except:
+                pass
+                
             if self.application:
                 # Graceful stop; run_polling will exit. Ensure coroutine is awaited from thread loop.
                 if self._loop and self._loop.is_running():
-                    fut = asyncio.run_coroutine_threadsafe(self.application.stop(), self._loop)
-                    fut.result(timeout=5)
+                    try:
+                        fut = asyncio.run_coroutine_threadsafe(self.application.stop(), self._loop)
+                        fut.result(timeout=5)
+                    except Exception as e:
+                        # Treat 'Application is not running' as already-stopped; ignore
+                        try:
+                            msg = str(e).lower()
+                        except Exception:
+                            msg = ""
+                        if "not running" in msg or "application is not running" in msg:
+                            logger.debug("Telegram application already stopped; ignoring stop error")
+                        else:
+                            logger.warning(f"Telegram stop encountered error: {e}")
                 else:
                     # Fallback: call stop synchronously if loop not available
                     try:
@@ -2064,9 +3514,30 @@ class TelegramBot:
                         pass
         except Exception:
             logger.exception("Error stopping Telegram application")
+        
+        # Cleanup auto terminal manager
+        try:
+            from auto_terminal_manager import auto_terminal_manager
+            auto_terminal_manager.cleanup()
+            logger.info("Auto Terminal Manager cleaned up")
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.error(f"Error cleaning up auto terminal manager: {e}")
 
     # External notification helpers
     def notify(self, chat_id: int, text: str):
+        """Queue a message for sending (non-blocking)"""
+        try:
+            self._message_queue.put((chat_id, text, 'send'), block=False)
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to queue message for chat {chat_id}: {e}")
+            # Fallback to direct sending
+            return self._send_message_direct(chat_id, text)
+
+    def _send_message_direct(self, chat_id: int, text: str):
+        """Send message directly (used by queue worker)"""
         try:
             if not self.application or not self._loop:
                 return None
@@ -2078,6 +3549,22 @@ class TelegramBot:
                 # Allow more time for Telegram API under load
                 result = fut.result(timeout=15)
                 return result.message_id if result else None
+            except RetryAfter as e:
+                # Rate limit hit - log with descriptive message per user preference
+                logger.warning(f"Rate limit exceeded (retry in {e.retry_after} seconds)")
+                try:
+                    fut.cancel()
+                except Exception:
+                    pass
+                return None
+            except TelegramError as e:
+                # Other Telegram API errors - log descriptively
+                logger.warning(f"Telegram API error ({e.message})")
+                try:
+                    fut.cancel()
+                except Exception:
+                    pass
+                return None
             except Exception as e:
                 # On timeout or cancellation, attempt to cancel and log at warning level
                 try:
@@ -2090,7 +3577,17 @@ class TelegramBot:
             return None
     
     def update_message(self, chat_id: int, message_id: int, text: str):
-        """Update an existing message"""
+        """Queue a message update (non-blocking)"""
+        try:
+            self._message_queue.put((chat_id, text, 'update', message_id), block=False)
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to queue message update for chat {chat_id}: {e}")
+            # Fallback to direct update
+            return self._update_message_direct(chat_id, message_id, text)
+
+    def _update_message_direct(self, chat_id: int, message_id: int, text: str):
+        """Update an existing message directly (used by queue worker)"""
         try:
             if not self.application or not self._loop:
                 logger.warning(f"Cannot update message - application or loop not available for chat {chat_id}")
@@ -2109,7 +3606,15 @@ class TelegramBot:
                 success = result is not None
                 logger.debug(f"Message update result for chat {chat_id}, message_id {message_id}: {success}")
                 return success
-            except Exception as e:
+            except RetryAfter as e:
+                # Rate limit hit - log with descriptive message per user preference
+                logger.warning(f"Rate limit exceeded (retry in {e.retry_after} seconds)")
+                try:
+                    fut.cancel()
+                except Exception:
+                    pass
+                return False
+            except TelegramError as e:
                 # Treat "message is not modified" as a successful no-op
                 try:
                     msg = str(e).lower()
@@ -2118,10 +3623,32 @@ class TelegramBot:
                 if "message is not modified" in msg or "not modified" in msg:
                     logger.debug(f"Message not modified for chat {chat_id}, message_id {message_id}; skipping update")
                     return True
+                # Other Telegram API errors - log descriptively
+                logger.warning(f"Telegram API error ({e.message})")
+                try:
+                    fut.cancel()
+                except Exception:
+                    pass
+                return False
+            except Exception as e:
                 logger.warning(f"Message update failed for chat {chat_id}, message_id {message_id}: {e}")
                 # On timeout or cancellation, attempt to cancel and log at warning level
                 try:
                     fut.cancel()
+                except Exception:
+                    pass
+                # Fallback: send a new message if the original cannot be edited (400 Bad Request)
+                try:
+                    if any(x in msg for x in [
+                        "message to edit not found",
+                        "message can't be edited",
+                        "message identifier is not specified",
+                        "bad request",
+                        "chat not found",
+                    ]):
+                        logger.info(f"Falling back to sending a new message for chat {chat_id}")
+                        self.send_message(chat_id, text)
+                        return True
                 except Exception:
                     pass
                 return False
@@ -2150,7 +3677,25 @@ class TelegramBot:
                     fut.cancel()
                 except Exception:
                     pass
-                logger.warning(f"Telegram edit_message timed out/cancelled for chat {chat_id}: {e}")
+                # Fallback on 400 Bad Request or non-editable cases: send a new message
+                try:
+                    msg = str(e).lower()
+                except Exception:
+                    msg = ""
+                logger.warning(f"Telegram edit_message failed for chat {chat_id}: {e}")
+                try:
+                    if any(x in msg for x in [
+                        "message to edit not found",
+                        "message can't be edited",
+                        "message identifier is not specified",
+                        "bad request",
+                        "chat not found",
+                    ]):
+                        logger.info(f"Falling back to sending a new message for chat {chat_id}")
+                        self.send_message(chat_id, text)
+                        return None
+                except Exception:
+                    pass
                 return None
         except Exception:
             logger.exception(f"Failed to edit message {message_id} in chat {chat_id}")

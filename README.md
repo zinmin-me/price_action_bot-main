@@ -1,9 +1,3 @@
-# activate venv
-.\venv\Scripts\activate
-
-# run 
-python main.py
-
 # Price Action Trading Bot
 
 An advanced algorithmic trading bot that uses multiple price action strategies with enhanced risk management, AI integration, and comprehensive database management for MetaTrader 5.
@@ -38,6 +32,7 @@ An advanced algorithmic trading bot that uses multiple price action strategies w
 - **Comprehensive Logging**: Detailed trade and performance logs
 - **Database Storage**: Persistent trade history and user management
 - **User Authorization**: Secure access control with MT5 account associations
+- **Multi-Terminal Support**: Dedicated terminals for each user with complete isolation
 
 ## 📊 Recent Performance Improvements
 
@@ -256,6 +251,7 @@ Stores authorized Telegram users who can access the bot.
 |--------|------|-------------|
 | bot_user_id | INTEGER PRIMARY KEY | Auto-incrementing unique identifier |
 | telegram_chat_id | INTEGER UNIQUE | Telegram chat ID (must be unique) |
+| is_admin | BOOLEAN | Whether user has admin privileges |
 | created_at | TIMESTAMP | When the user was added |
 | updated_at | TIMESTAMP | Last update time |
 
@@ -267,6 +263,7 @@ Stores MT5 account associations for bot users.
 | mt_account_id | INTEGER PRIMARY KEY | Auto-incrementing unique identifier |
 | bot_user_id | INTEGER | Foreign key to bot_user table |
 | mt_account_number | INTEGER | MT5 account number |
+| terminal_name | TEXT | Terminal name (format: tmn_{telegram_chat_id}) |
 | created_at | TIMESTAMP | When the account was associated |
 | updated_at | TIMESTAMP | Last update time |
 
@@ -293,6 +290,337 @@ python manage_users.py mt_accounts
 # Remove a user
 python manage_users.py remove 123456789
 ```
+
+## 🖥️ Multi-Terminal System
+
+### Overview
+The multi-terminal system allows you to:
+- Run separate MT5 terminal instances for different accounts
+- Isolate trading operations between accounts
+- Manage multiple brokers simultaneously
+- Have dedicated terminals for demo vs live accounts
+
+### Quick Start
+
+#### 1. Setup Multi-Terminal Configuration
+Run the setup script to configure your terminals:
+
+```bash
+python setup_multi_terminal.py
+```
+
+This will:
+- Find all available MT5 installations
+- Guide you through configuring each terminal
+- Create a `terminals_config.json` file
+- Test the configuration
+
+#### 2. Example Configuration
+Your `terminals_config.json` will look like this:
+
+```json
+{
+  "terminals": [
+    {
+      "name": "demo_account_1",
+      "terminal_path": "C:\\Program Files\\MetaTrader 5\\terminal64.exe",
+      "login": 12345,
+      "password": "demo_password_1",
+      "server": "DemoServer",
+      "symbol": "EURUSD",
+      "timeframe": "M15",
+      "auto_start": true,
+      "port_offset": 0
+    },
+    {
+      "name": "live_account_1",
+      "terminal_path": "C:\\Program Files\\MetaTrader 5\\terminal64.exe",
+      "login": 67890,
+      "password": "live_password_1",
+      "server": "LiveServer",
+      "symbol": "GBPUSD",
+      "timeframe": "M15",
+      "auto_start": true,
+      "port_offset": 0
+    }
+  ]
+}
+```
+
+### Usage Methods
+
+#### Method 1: Programmatic Usage
+```python
+from terminal_manager import TerminalManager, TerminalConfig
+from mt5_connector import MT5Connector
+
+# Initialize terminal manager
+manager = TerminalManager()
+
+# Load configuration
+manager.create_terminal_configs_from_file("terminals_config.json")
+
+# Start all terminals
+manager.start_all_terminals()
+
+# Create connectors for each account
+demo_connector = MT5Connector(
+    login=12345,
+    password="demo_password_1",
+    server="DemoServer",
+    terminal_name="demo_account_1",
+    dedicated_terminal=True
+)
+
+live_connector = MT5Connector(
+    login=67890,
+    password="live_password_1",
+    server="LiveServer",
+    terminal_name="live_account_1",
+    dedicated_terminal=True
+)
+
+# Connect to accounts
+demo_connector.connect()
+live_connector.connect()
+
+# Now you can trade on both accounts simultaneously
+```
+
+#### Method 2: Telegram Bot Usage
+
+##### Login with Dedicated Terminal
+```
+/login 12345 demo_password_1 DemoServer demo_account_1
+```
+
+##### Login with Shared Terminal (default behavior)
+```
+/login 12345 demo_password_1 DemoServer
+```
+
+##### Terminal Management Commands (Admin Only)
+```
+/terminals                    # Show all terminal status
+/terminal_start demo_account_1 # Start specific terminal
+/terminal_stop demo_account_1  # Stop specific terminal
+/terminal_restart demo_account_1 # Restart specific terminal
+/sessions                     # Show active sessions with terminal info
+```
+
+### Terminal Management
+
+#### TerminalManager Class
+The `TerminalManager` class handles all terminal operations:
+
+```python
+from terminal_manager import terminal_manager
+
+# Get terminal status
+status = terminal_manager.get_terminal_status()
+
+# Start specific terminal
+terminal_manager.start_terminal("demo_account_1")
+
+# Stop specific terminal
+terminal_manager.stop_terminal("demo_account_1")
+
+# Restart terminal
+terminal_manager.restart_terminal("demo_account_1")
+
+# Start monitoring (auto-restart failed terminals)
+terminal_manager.start_monitoring()
+```
+
+#### Terminal Status Types
+- 🟢 **running**: Terminal is active and connected
+- 🔴 **stopped**: Terminal is not running
+- 🟡 **starting**: Terminal is in the process of starting
+- ❌ **failed**: Terminal failed to start
+- 💥 **crashed**: Terminal crashed and needs restart
+- ⚪ **configured**: Terminal is configured but not started
+
+### MT5Connector Updates
+The `MT5Connector` class now supports dedicated terminals:
+
+```python
+# Shared terminal (default)
+connector = MT5Connector(
+    login=12345,
+    password="password",
+    server="server"
+)
+
+# Dedicated terminal
+connector = MT5Connector(
+    login=12345,
+    password="password",
+    server="server",
+    terminal_name="demo_account_1",
+    dedicated_terminal=True
+)
+
+# Get terminal information
+terminal_info = connector.get_terminal_info()
+print(terminal_info)
+# Output: {'type': 'dedicated', 'terminal_name': 'demo_account_1', 'status': {...}}
+```
+
+### Configuration Options
+
+#### Terminal Configuration Fields
+- **name**: Unique identifier for the terminal
+- **terminal_path**: Path to MT5 executable
+- **login**: Account login number
+- **password**: Account password
+- **server**: Broker server name
+- **symbol**: Default trading symbol
+- **timeframe**: Default timeframe
+- **auto_start**: Whether to start automatically
+- **port_offset**: Port offset for data connections (if needed)
+
+#### Settings
+- **monitoring_enabled**: Enable background monitoring
+- **auto_restart_failed_terminals**: Auto-restart crashed terminals
+- **max_restart_attempts**: Maximum restart attempts before giving up
+- **restart_delay_seconds**: Delay between restart attempts
+- **health_check_interval_seconds**: How often to check terminal health
+
+### Monitoring and Troubleshooting
+
+#### Health Monitoring
+The system automatically monitors terminal health:
+
+```python
+# Start monitoring
+terminal_manager.start_monitoring()
+
+# Check terminal health
+status = terminal_manager.get_terminal_status("demo_account_1")
+if status['status']['status'] == 'crashed':
+    print("Terminal crashed, attempting restart...")
+    terminal_manager.restart_terminal("demo_account_1")
+```
+
+#### Common Issues
+1. **Terminal won't start**
+   - Check if MT5 is installed at the specified path
+   - Verify account credentials
+   - Ensure no other MT5 instances are blocking
+
+2. **Connection failures**
+   - Check internet connection
+   - Verify server name is correct
+   - Ensure account is not already logged in elsewhere
+
+3. **Multiple terminals conflict**
+   - Each terminal should use the same MT5 installation
+   - Different accounts can use the same terminal path
+   - The system handles process isolation automatically
+
+### Best Practices
+1. **Terminal Naming**: Use descriptive names for terminals
+2. **Auto-Start Configuration**: Enable auto-start for frequently used accounts
+3. **Monitoring**: Always enable monitoring for production use
+4. **Security**: Store passwords securely and use environment variables
+
+## 👥 User Management
+
+### Admin Features
+
+#### Add User Button
+The "➕ Add User" button provides a simplified user creation process:
+
+1. **Click "➕ Add User" button**
+2. **Enter Telegram Chat ID** (e.g., `123456789`)
+3. **Bot automatically:**
+   - Creates user in database
+   - Generates terminal name: `tmn_123456789`
+   - Creates terminal configuration
+   - Sets up dedicated terminal
+4. **User can now login** and provide their MT5 credentials
+
+#### Delete User Button
+The "🗑️ Delete User" button provides a user-friendly way to delete specific users:
+
+1. **Click "🗑️ Delete User" button**
+2. **Bot shows available users for deletion**
+3. **Enter Telegram Chat ID** when prompted
+4. **Bot shows user details** and asks for confirmation
+5. **Type exact confirmation** text
+6. **User deleted** safely and completely
+
+#### Terminal Display
+The "🖥️ Terminals" button shows comprehensive terminal and user information:
+
+```
+🖥️ Terminal Management (Admin Only)
+
+👥 Users and Terminals:
+
+👑 1662162192 (Admin)
+   MT Account: 11045991 (🟢 Active)  ← User currently logged in
+   Terminal: tmn_1662162192 🟢
+
+👤 123456789 (User)
+   MT Account: 11012345              ← Stored in database
+   Terminal: tmn_123456789 🟢
+
+👤 987654321 (User)
+   MT Account: 11098765 (Terminal)   ← From terminal config
+   Terminal: tmn_987654321 🟢
+
+👤 555666777 (User)
+   MT Account: None                  ← No login info
+   Terminal: tmn_555666777 🔴
+```
+
+### User Management Commands
+
+#### Command Line Scripts
+```bash
+# Create terminal for existing user
+python create_terminal_for_existing_user.py 123456789 11096557
+
+# Delete specific user
+python delete_specific_user.py 987654321
+
+# List users
+python manage_users.py list
+```
+
+#### Telegram Bot Commands (Admin Only)
+```
+/add_user <telegram_chat_id>        # Add new user
+/delete_user <telegram_chat_id>     # Delete specific user
+/create_terminal <chat_id> <account> # Create terminal for existing user
+/list_users                         # List all users
+/db_stats                          # Database statistics
+```
+
+### Terminal Naming Convention
+- **Format**: `tmn_` + telegram_chat_id
+- **Examples**: 
+  - `tmn_123456789`
+  - `tmn_001`
+  - `tmn_1662162192`
+
+### Status Indicators
+
+#### MT Account Status
+- **🟢 Active** - User is currently logged in and active
+- **(no indicator)** - MT account stored in database
+- **(Terminal)** - Login info from terminal configuration
+- **None** - No MT account information available
+
+#### Terminal Status
+- **🟢** - Terminal running
+- **🔴** - Terminal stopped
+- **🟡** - Terminal starting
+- **❌** - Terminal failed
+- **💥** - Terminal crashed
+- **⚪** - Terminal configured
+- **❓** - Terminal status unknown
 
 ## 📊 Performance Monitoring
 
@@ -354,6 +682,11 @@ Position size is calculated based on:
    - Verify feature engineering
    - Ensure sufficient data points
 
+5. **Terminal Issues**
+   - Check if MT5 is installed at the specified path
+   - Verify account credentials
+   - Ensure no other MT5 instances are blocking
+
 ### Debug Mode
 ```bash
 python main.py --debug
@@ -372,6 +705,10 @@ price_action_bot-main/
 ├── manage_users.py        # User management script
 ├── setup_admin.py         # Admin setup script
 ├── setup_ai.py           # AI setup script
+├── terminal_manager.py    # Multi-terminal management
+├── auto_terminal_manager.py # Automatic terminal management
+├── create_terminal_for_existing_user.py # Terminal creation script
+├── delete_specific_user.py # User deletion script
 ├── strategies/            # Trading strategies
 │   ├── breakout.py
 │   ├── reversal_patterns.py
@@ -385,6 +722,7 @@ price_action_bot-main/
 │   └── ai_telegram_bot.py
 ├── logs/                  # Log files
 ├── trading_bot.db         # SQLite database
+├── terminals_config.json  # Terminal configuration
 ├── requirements.txt       # Python dependencies
 └── README.md             # This file
 ```

@@ -185,6 +185,11 @@ class ModelManager:
         for model_name, model in self.models.items():
             try:
                 logger.info(f"Training {model_name} model...")
+                # Guard: ensure model is an estimator with fit()
+                if not hasattr(model, 'fit'):
+                    logger.error(f"Model '{model_name}' is not a valid estimator (type={type(model)}). Skipping.")
+                    training_results[model_name] = {'error': 'invalid_estimator'}
+                    continue
                 
                 # Use smaller dataset for faster training
                 if len(X_train) > 5000:
@@ -726,9 +731,10 @@ class ModelManager:
             Dict: Loading results
         """
         if model_names is None:
-            # Try to load all available models
+            # Try to load all available models, but skip data processor artifacts
             model_files = [f for f in os.listdir(self.model_dir) if f.endswith(('.joblib', '.h5'))]
-            model_names = [f.split('.')[0] for f in model_files]
+            # Exclude data_processor artifacts explicitly
+            model_names = [f.split('.')[0] for f in model_files if not f.startswith('data_processor')]
         
         loading_results = {}
         
@@ -743,11 +749,17 @@ class ModelManager:
                     else:
                         loading_results[model_name] = False
                 else:
-                    # Load scikit-learn model
+                    # Load scikit-learn model (skip non-estimator artifacts)
                     model_path = os.path.join(self.model_dir, f"{model_name}.joblib")
                     if os.path.exists(model_path):
-                        self.models[model_name] = joblib.load(model_path)
-                        loading_results[model_name] = True
+                        obj = joblib.load(model_path)
+                        # Only accept objects that look like estimators
+                        if hasattr(obj, 'fit') and hasattr(obj, 'predict'):
+                            self.models[model_name] = obj
+                            loading_results[model_name] = True
+                        else:
+                            loading_results[model_name] = False
+                            logger.warning(f"Skipped loading non-estimator artifact: {model_name}")
                     else:
                         loading_results[model_name] = False
                 

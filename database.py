@@ -43,12 +43,26 @@ class DatabaseManager:
                     # Column already exists, ignore
                     pass
                 
+                # Add new columns to mt_account table if they don't exist
+                new_columns = [
+                    ("terminal_name", "TEXT")
+                ]
+                
+                for column_name, column_type in new_columns:
+                    try:
+                        cursor.execute(f"ALTER TABLE mt_account ADD COLUMN {column_name} {column_type}")
+                        conn.commit()
+                    except sqlite3.OperationalError:
+                        # Column already exists, ignore
+                        pass
+                
                 # Create mt_account table
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS mt_account (
                         mt_account_id INTEGER PRIMARY KEY AUTOINCREMENT,
                         bot_user_id INTEGER NOT NULL,
                         mt_account_number INTEGER NOT NULL,
+                        terminal_name TEXT,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         FOREIGN KEY (bot_user_id) REFERENCES bot_user (bot_user_id),
@@ -157,6 +171,42 @@ class DatabaseManager:
             logger.error(f"Failed to get bot user: {e}")
             return None
     
+    def get_bot_user_by_id(self, bot_user_id: int) -> Optional[Dict]:
+        """
+        Get bot user by bot user ID
+        
+        Args:
+            bot_user_id: Bot user ID
+            
+        Returns:
+            Dictionary with user info or None if not found
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                cursor.execute(
+                    "SELECT bot_user_id, telegram_chat_id, is_admin, created_at, updated_at FROM bot_user WHERE bot_user_id = ?",
+                    (bot_user_id,)
+                )
+                
+                result = cursor.fetchone()
+                
+                if result:
+                    return {
+                        'bot_user_id': result[0],
+                        'telegram_chat_id': result[1],
+                        'is_admin': bool(result[2]),
+                        'created_at': result[3],
+                        'updated_at': result[4]
+                    }
+                
+                return None
+                
+        except Exception as e:
+            logger.error(f"Failed to get bot user by ID: {e}")
+            return None
+    
     def is_telegram_user_authorized(self, telegram_chat_id: int) -> bool:
         """
         Check if a telegram chat ID is authorized to use the bot
@@ -183,13 +233,47 @@ class DatabaseManager:
         user = self.get_bot_user_by_telegram_chat_id(telegram_chat_id)
         return user is not None and user.get('is_admin', False)
     
-    def add_mt_account(self, bot_user_id: int, mt_account_number: int) -> Optional[int]:
+    def remove_bot_user(self, telegram_chat_id: int) -> bool:
         """
-        Add or update MT5 account for a bot user
+        Remove a bot user from the database
+        
+        Args:
+            telegram_chat_id: Telegram chat ID
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                cursor.execute(
+                    "DELETE FROM bot_user WHERE telegram_chat_id = ?",
+                    (telegram_chat_id,)
+                )
+                
+                deleted_count = cursor.rowcount
+                conn.commit()
+                
+                if deleted_count > 0:
+                    logger.info(f"Removed bot user with telegram_chat_id {telegram_chat_id}")
+                    return True
+                else:
+                    logger.info(f"No bot user found with telegram_chat_id {telegram_chat_id}")
+                    return False
+                
+        except Exception as e:
+            logger.error(f"Failed to remove bot user: {e}")
+            return False
+    
+    def add_mt_account(self, bot_user_id: int, mt_account_number: int, telegram_chat_id: int = None) -> Optional[int]:
+        """
+        Add or update MT5 account for a bot user (minimal storage)
         
         Args:
             bot_user_id: Bot user ID
             mt_account_number: MT5 account number
+            telegram_chat_id: Telegram chat ID for terminal naming (optional)
             
         Returns:
             mt_account_id if successful, None if failed
@@ -197,6 +281,12 @@ class DatabaseManager:
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
+                
+                # Generate terminal name based on telegram chat ID if available, otherwise use account number
+                if telegram_chat_id:
+                    terminal_name = f"tmn_{telegram_chat_id}"
+                else:
+                    terminal_name = f"user_{mt_account_number}"
                 
                 # Check if user already has an MT account
                 cursor.execute(
@@ -208,16 +298,22 @@ class DatabaseManager:
                 if existing:
                     # Update existing account
                     cursor.execute(
-                        "UPDATE mt_account SET mt_account_number = ?, updated_at = CURRENT_TIMESTAMP WHERE bot_user_id = ?",
-                        (mt_account_number, bot_user_id)
+                        """UPDATE mt_account SET 
+                           mt_account_number = ?, 
+                           terminal_name = ?,
+                           updated_at = CURRENT_TIMESTAMP 
+                           WHERE bot_user_id = ?""",
+                        (mt_account_number, terminal_name, bot_user_id)
                     )
                     mt_account_id = existing[0]
                     logger.info(f"Updated MT account {mt_account_id} for bot_user_id {bot_user_id}")
                 else:
                     # Insert new account
                     cursor.execute(
-                        "INSERT INTO mt_account (bot_user_id, mt_account_number) VALUES (?, ?)",
-                        (bot_user_id, mt_account_number)
+                        """INSERT INTO mt_account 
+                           (bot_user_id, mt_account_number, terminal_name) 
+                           VALUES (?, ?, ?)""",
+                        (bot_user_id, mt_account_number, terminal_name)
                     )
                     mt_account_id = cursor.lastrowid
                     logger.info(f"Added MT account {mt_account_id} for bot_user_id {bot_user_id}")
@@ -244,7 +340,7 @@ class DatabaseManager:
                 cursor = conn.cursor()
                 
                 cursor.execute(
-                    "SELECT mt_account_id, bot_user_id, mt_account_number, created_at, updated_at FROM mt_account WHERE bot_user_id = ?",
+                    "SELECT mt_account_id, bot_user_id, mt_account_number, terminal_name, created_at, updated_at FROM mt_account WHERE bot_user_id = ?",
                     (bot_user_id,)
                 )
                 
@@ -255,8 +351,9 @@ class DatabaseManager:
                         'mt_account_id': result[0],
                         'bot_user_id': result[1],
                         'mt_account_number': result[2],
-                        'created_at': result[3],
-                        'updated_at': result[4]
+                        'terminal_name': result[3],
+                        'created_at': result[4],
+                        'updated_at': result[5]
                     }
                 
                 return None
@@ -372,7 +469,7 @@ class DatabaseManager:
     
     def get_all_mt_accounts(self) -> List[Dict]:
         """
-        Get all MT5 accounts with user info
+        Get all MT5 accounts with user info and terminal configuration
         
         Returns:
             List of dictionaries with account and user info
@@ -383,7 +480,7 @@ class DatabaseManager:
                 
                 cursor.execute("""
                     SELECT ma.mt_account_id, ma.bot_user_id, ma.mt_account_number,
-                           bu.telegram_chat_id, ma.created_at, ma.updated_at
+                           ma.terminal_name, bu.telegram_chat_id, ma.created_at, ma.updated_at
                     FROM mt_account ma
                     JOIN bot_user bu ON ma.bot_user_id = bu.bot_user_id
                     ORDER BY ma.created_at
@@ -397,9 +494,10 @@ class DatabaseManager:
                         'mt_account_id': result[0],
                         'bot_user_id': result[1],
                         'mt_account_number': result[2],
-                        'telegram_chat_id': result[3],
-                        'created_at': result[4],
-                        'updated_at': result[5]
+                        'terminal_name': result[3],
+                        'telegram_chat_id': result[4],
+                        'created_at': result[5],
+                        'updated_at': result[6]
                     })
                 
                 return accounts
